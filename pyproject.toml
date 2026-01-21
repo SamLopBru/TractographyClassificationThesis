@@ -1,0 +1,14 @@
+[project]
+name = "sequentialtransformer"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dipy>=1.11.0",
+    "nibabel>=5.3.3",
+    "numpy>=2.4.1",
+    "pandas>=2.3.3",
+    "scipy>=1.17.0",
+    "torch>=2.9.1",
+]
