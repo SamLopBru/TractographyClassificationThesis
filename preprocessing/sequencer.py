@@ -8,6 +8,7 @@ import pathlib
 import pandas as pd
 import sys
 import os
+import h5py
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 from utils.dataset_handler import Tractoinferno_handler
@@ -96,42 +97,60 @@ class SphericalSequencer:
         output_path: str = None
     ):
         """
-        Process subject and save to compressed npz file
+        Process subject and save to HDF5 file organized by tracts
         
         Args:
             tractograms: List of tractogram file paths
-            com: Center of mass
-            r_min: Minimum radius for normalization
-            r_max: Maximum radius for normalization
-            output_path: Path to save the output npz file
+            subject: Subject identifier
+            output_path: Path to save the output HDF5 file
         """
-
         com, r_min, r_max = self.load_subject_data(subject)
-
         processed_streamlines, tract_ids = self.process_subject(tractograms, com, r_min, r_max)
         
-        # Save with metadata
-        np.savez_compressed(
-            output_path,
-            streamlines=np.array(processed_streamlines, dtype=object),  # List of variable-length arrays
-            tract_ids=np.array(tract_ids),
-            com=np.array(com),
-            r_min=r_min,
-            r_max=r_max,
-            n_streamlines=len(processed_streamlines),
-            allow_pickle=True
-        )
-        print("Saved " + subject + " to " + output_path)
-
-        del processed_streamlines, tract_ids
+        from collections import defaultdict
+        tract_streamlines = defaultdict(list)
+        for streamline, tract_id in zip(processed_streamlines, tract_ids):
+            tract_streamlines[tract_id].append(streamline)
+        
+        with h5py.File(output_path, 'w') as f:
+            f.attrs['subject'] = subject
+            f.attrs['com'] = com
+            f.attrs['r_min'] = r_min
+            f.attrs['r_max'] = r_max
+            
+            for tract_id, streamlines in tract_streamlines.items():
+                tract_group = f.create_group(f'tract_{tract_id}')
+                tract_group.attrs['tract_id'] = tract_id
+                tract_group.attrs['n_streamlines'] = len(streamlines)
+                
+                # Find max length in this tract
+                max_len = max(s.shape[0] for s in streamlines)
+                n_features = streamlines[0].shape[1]  # Should be 5
+                
+                # Pad all streamlines to max_len
+                padded = np.zeros((len(streamlines), max_len, n_features), dtype=np.float32)
+                lengths = np.zeros(len(streamlines), dtype=np.int32)
+                
+                for i, s in enumerate(streamlines):
+                    length = s.shape[0]
+                    padded[i, :length] = s.astype(np.float32)
+                    lengths[i] = length
+                
+                # Save padded streamlines and their actual lengths
+                tract_group.create_dataset(
+                    'streamlines',
+                    data=padded,
+                    chunks=(min(100, len(streamlines)), max_len, n_features)
+                )
+                tract_group.create_dataset('lengths', data=lengths)
 
 
 def main(scope: str):
     dataset_handler = Tractoinferno_handler("/home/blancolote/TFM/Tractoinferno/ds003900-download/derivatives", scope=scope)
-    for subject in dataset_handler.get_data():
+    for i, subject in enumerate(dataset_handler.get_data()):
         sequencer = SphericalSequencer(mri_path=subject["T1w"], encoded_tracts=ENCODED_TRACTS, csv_path="preprocessing/csvs/normalization_parameters_testset.csv")
-        sequencer.process_and_save_subject(subject["tracts"], subject["subject"], "preprocessing/sequences/" + subject["subject"] + ".npz")
-
+        sequencer.process_and_save_subject(subject["tracts"], subject["subject"], "preprocessing/sequences/" + subject["subject"] + ".hdf5")
+        
 if __name__ == "__main__":
     scope = "testset"
     main(scope)

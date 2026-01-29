@@ -9,5 +9,7 @@ wheels/
 # Virtual environments
 .venv
 
-*.npz
+# Data files
+*.hdf5
 *.csv
+*.png
