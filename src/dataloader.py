@@ -1,92 +1,146 @@
 from torch.utils.data import Dataset, DataLoader
 import torch
+from torch.nn.utils.rnn import pad_sequence
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 import h5py
 import numpy as np  
 
 
-class BalancedTractDataset(Dataset):
-    def __init__(self, hdf5_file_paths, sampling_percentage=0.20, min_streamlines=50, 
-                 max_streamlines=None, tract_ids=None, keep_padded=True):
+class StreamlineDataset(Dataset):
+    """
+    Dataset that treats each streamline as an individual sample.
+    
+    Each __getitem__ returns a single streamline with its label (tract_id).
+    This allows batching at the streamline level rather than subject level.
+    """
+    
+    def __init__(
+        self, 
+        hdf5_file_paths: List[str],
+        sampling_percentage: float = 0.20,
+        min_streamlines: int = 50,
+        max_streamlines_per_tract: int = None
+    ):
         """
         Args:
             hdf5_file_paths: List of HDF5 file paths
             sampling_percentage: Percentage of streamlines to sample from each tract (0-1)
             min_streamlines: Minimum number of streamlines per tract
-            max_streamlines: Maximum number of streamlines per tract (None = no limit)
-            tract_ids: List of specific tract IDs to include (None = all tracts)
-            keep_padded: If True, returns padded arrays (much faster)
+            max_streamlines_per_tract: Maximum number of streamlines per tract (None = no limit)
         """
         self.file_paths = hdf5_file_paths
         self.sampling_percentage = sampling_percentage
         self.min_streamlines = min_streamlines
-        self.max_streamlines = max_streamlines
-        self.target_tract_ids = tract_ids
-        self.keep_padded = keep_padded
+        self.max_streamlines_per_tract = max_streamlines_per_tract
+        
+        # Build index of all streamlines across all files
+        # Each entry: (file_path, tract_group_name, streamline_idx, length, tract_id)
+        self.streamline_index = []
+        self._build_index()
+    
+    def _build_index(self):
+        """Build an index of all streamlines in the dataset."""
+        print("Building streamline index...")
+        
+        for file_path in self.file_paths:
+            with h5py.File(file_path, 'r') as f:
+                for group_name in f.keys():
+                    if not group_name.startswith('tract_'):
+                        continue
+                    
+                    tract_group = f[group_name]
+                    tract_id = tract_group.attrs['tract_id']
+                    n_available = tract_group.attrs['n_streamlines']
+                    lengths = tract_group['lengths'][:]
+                    
+                    # Calculate how many streamlines to sample
+                    n_percentage = int(n_available * self.sampling_percentage)
+                    n_to_sample = max(self.min_streamlines, n_percentage)
+                    
+                    if self.max_streamlines_per_tract is not None:
+                        n_to_sample = min(n_to_sample, self.max_streamlines_per_tract)
+                    
+                    n_to_sample = min(n_to_sample, n_available)
+                    
+                    # Sample indices
+                    if n_to_sample < n_available:
+                        sampled_indices = np.sort(np.random.choice(n_available, n_to_sample, replace=False))
+                    else:
+                        sampled_indices = np.arange(n_available)
+                    
+                    # Add each streamline to the index
+                    for idx in sampled_indices:
+                        self.streamline_index.append({
+                            'file_path': file_path,
+                            'group_name': group_name,
+                            'streamline_idx': int(idx),
+                            'length': int(lengths[idx]),
+                            'tract_id': int(tract_id)
+                        })
+        
+        print(f"  Total streamlines indexed: {len(self.streamline_index)}")
+        
+        # Count per class
+        class_counts = {}
+        for item in self.streamline_index:
+            tid = item['tract_id']
+            class_counts[tid] = class_counts.get(tid, 0) + 1
+        print(f"  Classes: {len(class_counts)}")
+        print(f"  Streamlines per class: min={min(class_counts.values())}, max={max(class_counts.values())}")
     
     def __len__(self):
-        return len(self.file_paths)
+        return len(self.streamline_index)
     
-    def __getitem__(self, idx):
-        with h5py.File(self.file_paths[idx], 'r', rdcc_nbytes=1024**3, rdcc_nslots=10000) as f:
-            sampled_data = []
-            
-            for group_name in f.keys():
-                if not group_name.startswith('tract_'):
-                    continue
-                
-                tract_group = f[group_name]
-                tract_id = tract_group.attrs['tract_id']
-                
-                if self.target_tract_ids and tract_id not in self.target_tract_ids:
-                    continue
-                
-                n_available = tract_group.attrs['n_streamlines']
-                n_percentage = int(n_available * self.sampling_percentage)
-                n_to_sample = max(self.min_streamlines, n_percentage)
-                
-                if self.max_streamlines is not None:
-                    n_to_sample = min(n_to_sample, self.max_streamlines)
-                
-                n_to_sample = min(n_to_sample, n_available)
-                
-                if n_to_sample < n_available:
-                    idx_sample = np.sort(np.random.choice(n_available, n_to_sample, replace=False))
-                    sampled_streamlines_padded = tract_group['streamlines'][idx_sample]
-                    sampled_lengths = tract_group['lengths'][idx_sample]
-                else:
-                    sampled_streamlines_padded = tract_group['streamlines'][:]
-                    sampled_lengths = tract_group['lengths'][:]
-                
-                if self.keep_padded:
-                    # Much faster - return padded arrays directly
-                    sampled_data.append({
-                        'streamlines': torch.from_numpy(sampled_streamlines_padded),
-                        'lengths': torch.from_numpy(sampled_lengths),
-                        'tract_id': tract_id,
-                        'n_streamlines': len(sampled_streamlines_padded)
-                    })
-                else:
-                    # Optimized unpadding using list comprehension
-                    unpadded_streamlines = [
-                        torch.from_numpy(sampled_streamlines_padded[i, :sampled_lengths[i]].copy())
-                        for i in range(len(sampled_lengths))
-                    ]
-                    
-                    sampled_data.append({
-                        'streamlines': unpadded_streamlines,
-                        'tract_id': tract_id,
-                        'n_streamlines': len(unpadded_streamlines)
-                    })
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int, int]:
+        """
+        Get a single streamline.
         
-        return sampled_data
+        Returns:
+            streamline: Tensor of shape (seq_len, 5)
+            length: Actual length of the streamline
+            tract_id: Label for the streamline
+        """
+        item = self.streamline_index[idx]
+        
+        with h5py.File(item['file_path'], 'r') as f:
+            tract_group = f[item['group_name']]
+            
+            # Get the single streamline
+            streamline = tract_group['streamlines'][item['streamline_idx']]  # (max_len, 5)
+            length = item['length']
+            
+            # Trim to actual length (remove padding)
+            streamline = streamline[:length]
+        
+        return (
+            torch.from_numpy(streamline.astype(np.float32)),
+            length,
+            item['tract_id']
+        )
 
-def custom_collate(batch):
-    """Custom collate that handles variable-length tract data"""
-    # batch is a list of samples, where each sample is a list of tract dicts
-    return batch  # Return as-is, don't try to stack
 
+def streamline_collate_fn(batch: List[Tuple[torch.Tensor, int, int]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Collate function that pads streamlines to the same length within a batch.
+    
+    Args:
+        batch: List of (streamline, length, tract_id) tuples
+    
+    Returns:
+        streamlines: Padded tensor of shape (batch_size, max_seq_len, 5)
+        lengths: Tensor of shape (batch_size,) with actual lengths
+        labels: Tensor of shape (batch_size,) with tract_ids
+    """
+    streamlines = [item[0] for item in batch]
+    lengths = torch.tensor([item[1] for item in batch], dtype=torch.long)
+    labels = torch.tensor([item[2] for item in batch], dtype=torch.long)
+    
+    # Pad streamlines to max length in this batch
+    # pad_sequence expects (seq_len, features) tensors and pads along dim 0
+    padded_streamlines = pad_sequence(streamlines, batch_first=True, padding_value=0.0)
+    
+    return padded_streamlines, lengths, labels
 
 def verify_against_original():
     """Compare sampled data with original HDF5 file"""
@@ -133,28 +187,27 @@ if __name__ == "__main__":
     import time
     import os
     
-    paths = [os.path.join("preprocessing/sequences",path) for path in os.listdir("preprocessing/sequences")]
-    dataset = BalancedTractDataset(
+    paths = [os.path.join("sequences/testset",path) for path in os.listdir("sequences/testset")]
+    dataset = StreamlineDataset(
         paths,
-        sampling_percentage=0.01,
-        keep_padded=True
+        sampling_percentage=0.10,
     )
 
     dataloader_fast = DataLoader(
         dataset,
-        batch_size=4,
+        batch_size=1,
         shuffle=True,
         num_workers=8,
         pin_memory=True,
         prefetch_factor=2,
         persistent_workers=True,
-        collate_fn=custom_collate  
+        collate_fn=streamline_collate_fn  
     )
 
     start = time.time()
     for batch in dataloader_fast:
-        print(f"Batch size: {batch[0]}")
+        print(f"Batch size: {batch}")
         break
     
-    print(f"With workers: {time.time() - start:.2f} seconds")
+
     

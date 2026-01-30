@@ -148,11 +148,11 @@ class SphericalSequencer:
 def main(scope: str):
     dataset_handler = Tractoinferno_handler("/home/blancolote/TFM/Tractoinferno/ds003900-download/derivatives", scope=scope)
     for i, subject in enumerate(dataset_handler.get_data()):
-        sequencer = SphericalSequencer(mri_path=subject["T1w"], encoded_tracts=ENCODED_TRACTS, csv_path="preprocessing/csvs/normalization_parameters_testset.csv")
-        sequencer.process_and_save_subject(subject["tracts"], subject["subject"], "preprocessing/sequences/" + subject["subject"] + ".hdf5")
+        sequencer = SphericalSequencer(mri_path=subject["T1w"], encoded_tracts=ENCODED_TRACTS, csv_path=f"preprocessing/csvs/normalization_parameters_{scope}.csv")
+        sequencer.process_and_save_subject(subject["tracts"], subject["subject"], f"sequences/{scope}/" + subject["subject"] + ".hdf5")
         
 if __name__ == "__main__":
-    scope = "testset"
+    scope = "trainset"
     main(scope)
 
 

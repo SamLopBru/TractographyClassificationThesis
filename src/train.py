@@ -13,73 +13,9 @@ import json
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 
-from src.encoder import StreamlineEncoder, LightweightStreamlineEncoder, create_encoder
-from src.dataloader import BalancedTractDataset, custom_collate
-
-
-def prepare_batch(
-    batch: List, 
-    device: torch.device,
-    max_streamlines: int = None
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Prepare a batch from the dataloader for training.
-    
-    The dataloader returns a list of subjects, each containing tract dictionaries.
-    We need to flatten this into a single batch of streamlines with labels.
-    
-    Args:
-        batch: List of subject data from dataloader
-        device: Target device
-        max_streamlines: Maximum number of streamlines per batch (for memory management)
-    
-    Returns:
-        streamlines: (total_streamlines, max_seq_len, 5)
-        lengths: (total_streamlines,)
-        labels: (total_streamlines,)
-    """
-    all_streamlines = []
-    all_lengths = []
-    all_labels = []
-    
-    # Flatten batch: iterate over subjects, then tracts
-    for subject_data in batch:
-        for tract_dict in subject_data:
-            streamlines = tract_dict['streamlines']  # (n_streamlines, max_len, 5)
-            lengths = tract_dict['lengths']          # (n_streamlines,)
-            tract_id = tract_dict['tract_id']
-            n_streamlines = tract_dict['n_streamlines']
-            
-            all_streamlines.append(streamlines)
-            all_lengths.append(lengths)
-            all_labels.append(torch.full((n_streamlines,), tract_id, dtype=torch.long))
-    
-    # Pad to same max length across all tracts in this batch
-    max_len = max(s.shape[1] for s in all_streamlines)
-    n_features = all_streamlines[0].shape[2]
-    
-    padded_streamlines = []
-    for s in all_streamlines:
-        if s.shape[1] < max_len:
-            padding = torch.zeros(s.shape[0], max_len - s.shape[1], n_features)
-            s = torch.cat([s, padding], dim=1)
-        padded_streamlines.append(s)
-    
-    streamlines = torch.cat(padded_streamlines, dim=0)
-    lengths = torch.cat(all_lengths, dim=0)
-    labels = torch.cat(all_labels, dim=0)
-    
-    # Limit batch size to prevent OOM or CUDA attention errors (0 or None = auto-limit to 60000)
-    # CUDA Flash Attention has a hard limit of 65535 batch size
-    effective_max = max_streamlines if max_streamlines and max_streamlines > 0 else 60000
-    if streamlines.size(0) > effective_max:
-        # Randomly sample to keep batch size manageable
-        indices = torch.randperm(streamlines.size(0))[:effective_max]
-        streamlines = streamlines[indices]
-        lengths = lengths[indices]
-        labels = labels[indices]
-    
-    return streamlines.to(device), lengths.to(device), labels.to(device)
+from src.encoder import StreamlineEncoder, LightweightStreamlineEncoder
+from src.dataloader import StreamlineDataset, streamline_collate_fn
+from src.config import TrainConfig, DEFAULT_CONFIG
 
 
 def train_epoch(
@@ -91,7 +27,6 @@ def train_epoch(
     epoch: int,
     scaler: GradScaler = None,
     use_amp: bool = True,
-    max_streamlines: int = 2000,
     accumulation_steps: int = 1,
     log_interval: int = 10
 ) -> Dict[str, float]:
@@ -102,9 +37,12 @@ def train_epoch(
     total_samples = 0
     
     start_time = time.time()
+    optimizer.zero_grad()
     
-    for batch_idx, batch in enumerate(dataloader):
-        streamlines, lengths, labels = prepare_batch(batch, device, max_streamlines)
+    for batch_idx, (streamlines, lengths, labels) in enumerate(dataloader):
+        streamlines = streamlines.to(device)
+        lengths = lengths.to(device)
+        labels = labels.to(device)
         
         # Forward pass with optional mixed precision
         if use_amp and scaler is not None:
@@ -144,6 +82,18 @@ def train_epoch(
                   f"Loss: {avg_loss:.4f} | Acc: {accuracy:.2f}% | "
                   f"Time: {elapsed:.1f}s")
     
+    # Handle any remaining gradients
+    if (batch_idx + 1) % accumulation_steps != 0:
+        if use_amp and scaler is not None:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+        optimizer.zero_grad()
+    
     return {
         'loss': total_loss / total_samples,
         'accuracy': 100.0 * total_correct / total_samples
@@ -156,8 +106,7 @@ def validate(
     dataloader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
-    use_amp: bool = True,
-    max_streamlines: int = 2000
+    use_amp: bool = True
 ) -> Dict[str, float]:
     """Validate the model."""
     model.eval()
@@ -165,8 +114,10 @@ def validate(
     total_correct = 0
     total_samples = 0
     
-    for batch in dataloader:
-        streamlines, lengths, labels = prepare_batch(batch, device, max_streamlines)
+    for streamlines, lengths, labels in dataloader:
+        streamlines = streamlines.to(device)
+        lengths = lengths.to(device)
+        labels = labels.to(device)
         
         if use_amp:
             with autocast(device_type='cuda', dtype=torch.float16):
@@ -198,7 +149,6 @@ def train(
     save_dir: str = "checkpoints",
     patience: int = 10,
     use_amp: bool = True,
-    max_streamlines: int = 2000,
     accumulation_steps: int = 1
 ) -> Dict[str, List[float]]:
     """
@@ -234,13 +184,13 @@ def train(
         # Train
         train_metrics = train_epoch(
             model, train_loader, criterion, optimizer, device, epoch,
-            scaler=scaler, use_amp=use_amp, max_streamlines=max_streamlines,
+            scaler=scaler, use_amp=use_amp,
             accumulation_steps=accumulation_steps
         )
         print(f"\n  Train Loss: {train_metrics['loss']:.4f} | Train Acc: {train_metrics['accuracy']:.2f}%")
         
         # Validate
-        val_metrics = validate(model, val_loader, criterion, device, use_amp=use_amp, max_streamlines=max_streamlines)
+        val_metrics = validate(model, val_loader, criterion, device, use_amp=use_amp)
         print(f"  Val Loss: {val_metrics['loss']:.4f} | Val Acc: {val_metrics['accuracy']:.2f}%")
         
         # Update scheduler
@@ -292,27 +242,60 @@ def train(
 
 
 def main():
+    # Use DEFAULT_CONFIG values as defaults for argparse
+    cfg = DEFAULT_CONFIG
+    
     parser = argparse.ArgumentParser(description='Train Streamline Bundle Classifier')
-    parser.add_argument('--data_dir', type=str, default='preprocessing/sequences',
+    
+    # Data arguments
+    parser.add_argument('--data_dir', type=str, default=cfg.data_dir,
                         help='Directory containing HDF5 files')
-    parser.add_argument('--encoder_type', type=str, default='transformer',
-                        choices=['transformer', 'lstm'], help='Type of encoder')
-    parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
-    parser.add_argument('--batch_size', type=int, default=4, help='Batch size (subjects)')
-    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--d_model', type=int, default=128, help='Model dimension')
-    parser.add_argument('--num_layers', type=int, default=4, help='Number of layers')
-    parser.add_argument('--sampling_pct', type=float, default=0.05,
+    parser.add_argument('--val_split', type=float, default=cfg.val_split,
+                        help='Validation split')
+    parser.add_argument('--sampling_pct', type=float, default=cfg.sampling_pct,
                         help='Percentage of streamlines to sample per tract')
-    parser.add_argument('--num_workers', type=int, default=4, help='DataLoader workers')
-    parser.add_argument('--save_dir', type=str, default='checkpoints', help='Save directory')
-    parser.add_argument('--val_split', type=float, default=0.2, help='Validation split')
-    parser.add_argument('--patience', type=int, default=10, help='Early stopping patience')
-    parser.add_argument('--max_streamlines', type=int, default=0,
-                        help='Max streamlines per batch (0 = no limit)')
-    parser.add_argument('--accumulation_steps', type=int, default=4,
+    parser.add_argument('--max_streamlines_per_tract', type=int, default=cfg.max_streamlines_per_tract,
+                        help='Max streamlines per tract (None = no limit)')
+    
+    # Model arguments
+    parser.add_argument('--encoder_type', type=str, default=cfg.encoder_type,
+                        choices=['transformer', 'lstm'], help='Type of encoder')
+    parser.add_argument('--d_model', type=int, default=cfg.d_model,
+                        help='Model dimension')
+    parser.add_argument('--nhead', type=int, default=cfg.nhead,
+                        help='Number of attention heads')
+    parser.add_argument('--num_layers', type=int, default=cfg.num_layers,
+                        help='Number of layers')
+    parser.add_argument('--dim_feedforward', type=int, default=cfg.dim_feedforward,
+                        help='Feedforward dimension')
+    parser.add_argument('--num_classes', type=int, default=cfg.num_classes,
+                        help='Number of bundle classes')
+    parser.add_argument('--dropout', type=float, default=cfg.dropout,
+                        help='Dropout rate')
+    parser.add_argument('--pooling', type=str, default=cfg.pooling,
+                        choices=['cls', 'mean', 'max'], help='Pooling strategy')
+    
+    # Training arguments
+    parser.add_argument('--epochs', type=int, default=cfg.epochs,
+                        help='Number of epochs')
+    parser.add_argument('--batch_size', type=int, default=cfg.batch_size,
+                        help='Batch size (streamlines)')
+    parser.add_argument('--lr', type=float, default=cfg.lr,
+                        help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=cfg.weight_decay,
+                        help='Weight decay')
+    parser.add_argument('--accumulation_steps', type=int, default=cfg.accumulation_steps,
                         help='Gradient accumulation steps')
-    parser.add_argument('--no_amp', action='store_true', help='Disable mixed precision')
+    parser.add_argument('--patience', type=int, default=cfg.patience,
+                        help='Early stopping patience')
+    parser.add_argument('--no_amp', action='store_true',
+                        help='Disable mixed precision')
+    
+    # System arguments
+    parser.add_argument('--num_workers', type=int, default=cfg.num_workers,
+                        help='DataLoader workers')
+    parser.add_argument('--save_dir', type=str, default=cfg.save_dir,
+                        help='Save directory')
     
     args = parser.parse_args()
     
@@ -332,26 +315,28 @@ def main():
     
     print(f"Train files: {len(train_files)}, Val files: {len(val_files)}")
     
-    # Create datasets
-    train_dataset = BalancedTractDataset(
+    # Create datasets - now each sample is a single streamline
+    train_dataset = StreamlineDataset(
         train_files,
         sampling_percentage=args.sampling_pct,
-        keep_padded=True
+        max_streamlines_per_tract=args.max_streamlines_per_tract
     )
-    val_dataset = BalancedTractDataset(
+    val_dataset = StreamlineDataset(
         val_files,
         sampling_percentage=args.sampling_pct,
-        keep_padded=True
+        max_streamlines_per_tract=args.max_streamlines_per_tract
     )
     
-    # Create dataloaders
+    print(f"\nTrain samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+    
+    # Create dataloaders - batch_size now refers to number of streamlines
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
-        collate_fn=custom_collate,
+        collate_fn=streamline_collate_fn,
         persistent_workers=args.num_workers > 0
     )
     val_loader = DataLoader(
@@ -360,27 +345,29 @@ def main():
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
-        collate_fn=custom_collate,
+        collate_fn=streamline_collate_fn,
         persistent_workers=args.num_workers > 0
     )
     
     # Create model
     if args.encoder_type == 'transformer':
         model = StreamlineEncoder(
-            input_size=5,
+            input_size=cfg.input_size,
             d_model=args.d_model,
-            nhead=8,
+            nhead=args.nhead,
             num_layers=args.num_layers,
-            num_classes=32,
-            dropout=0.1
+            dim_feedforward=args.dim_feedforward,
+            num_classes=args.num_classes,
+            dropout=args.dropout,
+            pooling=args.pooling
         )
     else:
         model = LightweightStreamlineEncoder(
-            input_size=5,
+            input_size=cfg.input_size,
             hidden_size=args.d_model,
             num_layers=args.num_layers,
-            num_classes=32,
-            dropout=0.1
+            num_classes=args.num_classes,
+            dropout=args.dropout
         )
     
     print(f"\nModel: {args.encoder_type}")
@@ -394,13 +381,35 @@ def main():
         device=device,
         epochs=args.epochs,
         lr=args.lr,
+        weight_decay=args.weight_decay,
         save_dir=args.save_dir,
         patience=args.patience,
         use_amp=not args.no_amp,
-        max_streamlines=args.max_streamlines,
         accumulation_steps=args.accumulation_steps
     )
 
 
 if __name__ == '__main__':
     main()
+
+
+"""
+EXAMPLES OF USE:
+# Train with default config values
+python src/train.py
+
+# Train with LSTM encoder
+python src/train.py --encoder_type lstm
+
+# Train with larger batch size and more epochs
+python src/train.py --batch_size 512 --epochs 100
+
+# Train with custom data directory
+python src/train.py --data_dir /path/to/your/hdf5/files
+
+# Disable mixed precision (if you have GPU issues)
+python src/train.py --no_amp
+
+# Use mean pooling instead of CLS token
+python src/train.py --pooling mean
+"""

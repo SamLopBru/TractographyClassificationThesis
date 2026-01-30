@@ -277,22 +277,25 @@ def create_encoder(
 
 
 if __name__ == "__main__":
+    from src.config import TrainConfig, DEFAULT_CONFIG
+
+    cfg = DEFAULT_CONFIG
+
     # Test the encoders
-    batch_size = 8
+    batch_size = cfg.batch_size
     seq_len = 150  # Variable length streamlines
-    input_size = 5
-    num_classes = 32
+    input_size = cfg.input_size
+    num_classes = cfg.num_classes
     
     # Create sample data
     x = torch.randn(batch_size, seq_len, input_size)
     lengths = torch.randint(50, seq_len + 1, (batch_size,))
     
-    print("Testing StreamlineEncoder (Transformer)...")
     transformer_encoder = StreamlineEncoder(
         input_size=input_size,
-        d_model=128,
-        nhead=8,
-        num_layers=4,
+        d_model=cfg.d_model,
+        nhead=cfg.nhead,
+        num_layers=cfg.num_layers,
         num_classes=num_classes
     )
     
@@ -300,18 +303,3 @@ if __name__ == "__main__":
     print(f"  Input shape: {x.shape}")
     print(f"  Output shape: {output.shape}")
     print(f"  Parameters: {sum(p.numel() for p in transformer_encoder.parameters()):,}")
-    
-    print("\nTesting LightweightStreamlineEncoder (LSTM)...")
-    lstm_encoder = LightweightStreamlineEncoder(
-        input_size=input_size,
-        hidden_size=128,
-        num_layers=2,
-        num_classes=num_classes
-    )
-    
-    output = lstm_encoder(x, lengths=lengths)
-    print(f"  Input shape: {x.shape}")
-    print(f"  Output shape: {output.shape}")
-    print(f"  Parameters: {sum(p.numel() for p in lstm_encoder.parameters()):,}")
-    
-    print("\nAll tests passed!")
