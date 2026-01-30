@@ -7,6 +7,7 @@ import sys
 import os
 import pandas as pd
 import time
+import argparse
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
@@ -76,4 +77,7 @@ def main(scope: str):
     print(f"\nTotal time: {end_time - start_time:.2f} seconds")
 
 if __name__ == "__main__":
-    main("testset")
+    parser = argparse.ArgumentParser(description='Compute normalization parameters for streamlines')
+    parser.add_argument('--scope', type=str, default='testset', help='Scope of the dataset')
+    args = parser.parse_args()
+    main(args.scope)

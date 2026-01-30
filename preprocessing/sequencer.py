@@ -9,6 +9,7 @@ import pandas as pd
 import sys
 import os
 import h5py
+import argparse
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 from utils.dataset_handler import Tractoinferno_handler
@@ -152,8 +153,10 @@ def main(scope: str):
         sequencer.process_and_save_subject(subject["tracts"], subject["subject"], f"sequences/{scope}/" + subject["subject"] + ".hdf5")
         
 if __name__ == "__main__":
-    scope = "trainset"
-    main(scope)
+    parser = argparse.ArgumentParser(description='Generate spherical coordinates for streamlines')
+    parser.add_argument('--scope', type=str, default='testset', help='Scope of the dataset')
+    args = parser.parse_args()
+    main(args.scope)
 
 
 

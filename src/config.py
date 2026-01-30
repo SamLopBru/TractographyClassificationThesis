@@ -3,9 +3,11 @@ Configuration class for training the Streamline Bundle Classifier.
 
 This module provides default configuration values that are used when 
 command-line arguments are not provided.
+
+Optimized for RTX 5060 Ti (16GB VRAM).
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -22,27 +24,27 @@ class TrainConfig:
     # Model configuration
     encoder_type: str = "transformer"  # "transformer" or "lstm"
     input_size: int = 5
-    d_model: int = 128
-    nhead: int = 8
-    num_layers: int = 4
-    dim_feedforward: int = 512
+    d_model: int = 256          # Larger for better capacity
+    nhead: int = 8              # 256 / 8 = 32 dim per head
+    num_layers: int = 6         # Deeper representations
+    dim_feedforward: int = 1024 # 4x d_model ratio
     num_classes: int = 32
     dropout: float = 0.1
-    pooling: str = "cls"  # "cls", "mean", or "max"
+    pooling: str = "mean"       # "cls", "mean", or "max"
     
     # Training configuration
-    epochs: int = 50
-    batch_size: int = 2048
-    lr: float = 1e-4
-    weight_decay: float = 1e-5
+    epochs: int = 100           # More epochs for convergence
+    batch_size: int = 512       # Safe for 16GB with d_model=256
+    lr: float = 3e-4            # Higher LR for larger batch
+    weight_decay: float = 1e-4  # More regularization
     accumulation_steps: int = 1
-    patience: int = 10
-    use_amp: bool = True
+    patience: int = 15          # More patience
+    use_amp: bool = True        # Essential for memory
     
     # System configuration
-    num_workers: int = 4
+    num_workers: int = 8        # Better parallelism
     save_dir: str = "checkpoints"
-    log_interval: int = 10
+    log_interval: int = 50      # Less frequent logging
     
     def __post_init__(self):
         """Validate configuration after initialization."""
