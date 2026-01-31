@@ -248,10 +248,10 @@ def main():
     parser = argparse.ArgumentParser(description='Train Streamline Bundle Classifier')
     
     # Data arguments
-    parser.add_argument('--data_dir', type=str, default=cfg.data_dir,
-                        help='Directory containing HDF5 files')
-    parser.add_argument('--val_split', type=float, default=cfg.val_split,
-                        help='Validation split')
+    parser.add_argument('--train_dir', type=str, required=True,
+                        help='Directory containing training HDF5 files')
+    parser.add_argument('--val_dir', type=str, required=True,
+                        help='Directory containing validation HDF5 files')
     parser.add_argument('--sampling_pct', type=float, default=cfg.sampling_pct,
                         help='Percentage of streamlines to sample per tract')
     parser.add_argument('--max_streamlines_per_tract', type=int, default=cfg.max_streamlines_per_tract,
@@ -303,17 +303,15 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Get all HDF5 files
-    data_dir = Path(args.data_dir)
-    all_files = sorted([str(f) for f in data_dir.glob('*.hdf5')])
-    print(f"Found {len(all_files)} HDF5 files")
+    # Get training HDF5 files
+    train_dir = Path(args.train_dir)
+    train_files = sorted([str(f) for f in train_dir.glob('*.hdf5')])
+    print(f"Found {len(train_files)} training HDF5 files")
     
-    # Train/val split
-    n_val = max(1, int(len(all_files) * args.val_split))
-    train_files = all_files[:-n_val]
-    val_files = all_files[-n_val:]
-    
-    print(f"Train files: {len(train_files)}, Val files: {len(val_files)}")
+    # Get validation HDF5 files
+    val_dir = Path(args.val_dir)
+    val_files = sorted([str(f) for f in val_dir.glob('*.hdf5')])
+    print(f"Found {len(val_files)} validation HDF5 files")
     
     # Create datasets - now each sample is a single streamline
     train_dataset = StreamlineDataset(

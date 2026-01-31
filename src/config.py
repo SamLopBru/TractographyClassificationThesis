@@ -16,8 +16,8 @@ class TrainConfig:
     """Configuration for training the streamline encoder model."""
     
     # Data configuration
-    data_dir: str = "sequences/trainset"
-    val_split: float = 0.2
+    train_dir: str = "sequences/trainset"
+    val_dir: str = "sequences/validset"
     sampling_pct: float = 0.1
     max_streamlines_per_tract: Optional[int] = None
     
@@ -52,8 +52,6 @@ class TrainConfig:
             f"encoder_type must be 'transformer' or 'lstm', got {self.encoder_type}"
         assert self.pooling in ["cls", "mean", "max"], \
             f"pooling must be 'cls', 'mean', or 'max', got {self.pooling}"
-        assert 0 < self.val_split < 1, \
-            f"val_split must be between 0 and 1, got {self.val_split}"
         assert 0 < self.sampling_pct <= 1, \
             f"sampling_pct must be between 0 and 1, got {self.sampling_pct}"
 
