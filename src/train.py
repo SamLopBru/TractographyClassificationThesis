@@ -14,7 +14,7 @@ import json
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 
 from src.encoder import StreamlineEncoder, LightweightStreamlineEncoder
-from src.dataloader import StreamlineDataset, streamline_collate_fn
+from src.dataloader import StreamlineDataset, StratifiedEpochSampler, streamline_collate_fn
 from src.config import TrainConfig, DEFAULT_CONFIG
 
 
@@ -149,7 +149,8 @@ def train(
     save_dir: str = "checkpoints",
     patience: int = 10,
     use_amp: bool = True,
-    accumulation_steps: int = 1
+    accumulation_steps: int = 1,
+    train_sampler: StratifiedEpochSampler = None
 ) -> Dict[str, List[float]]:
     """
     Full training loop with validation, early stopping, and mixed precision.
@@ -177,6 +178,10 @@ def train(
     patience_counter = 0
     
     for epoch in range(1, epochs + 1):
+        # Update sampler for new epoch (different random subset)
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        
         print(f"\n{'='*60}")
         print(f"Epoch {epoch}/{epochs} | LR: {scheduler.get_last_lr()[0]:.2e}")
         print('='*60)
@@ -248,12 +253,18 @@ def main():
     parser = argparse.ArgumentParser(description='Train Streamline Bundle Classifier')
     
     # Data arguments
-    parser.add_argument('--train_dir', type=str, required=True,
+    parser.add_argument('--train_dir', type=str, default=cfg.train_dir,
                         help='Directory containing training HDF5 files')
-    parser.add_argument('--val_dir', type=str, required=True,
+    parser.add_argument('--val_dir', type=str, default=cfg.val_dir,
                         help='Directory containing validation HDF5 files')
     parser.add_argument('--sampling_pct', type=float, default=cfg.sampling_pct,
-                        help='Percentage of streamlines to sample per tract')
+                        help='Percentage of streamlines to index per tract')
+    parser.add_argument('--epoch_sampling_pct', type=float, default=cfg.epoch_sampling_pct,
+                        help='Percentage of indexed streamlines to use per epoch')
+    parser.add_argument('--min_samples_per_class', type=int, default=cfg.min_samples_per_class,
+                        help='Minimum samples per class per epoch')
+    parser.add_argument('--full_sample_threshold', type=int, default=cfg.full_sample_threshold,
+                        help='If tract has fewer streamlines than this, take all 100%')
     parser.add_argument('--max_streamlines_per_tract', type=int, default=cfg.max_streamlines_per_tract,
                         help='Max streamlines per tract (None = no limit)')
     
@@ -317,21 +328,34 @@ def main():
     train_dataset = StreamlineDataset(
         train_files,
         sampling_percentage=args.sampling_pct,
-        max_streamlines_per_tract=args.max_streamlines_per_tract
+        max_streamlines_per_tract=args.max_streamlines_per_tract,
+        full_sample_threshold=args.full_sample_threshold
     )
     val_dataset = StreamlineDataset(
         val_files,
         sampling_percentage=args.sampling_pct,
-        max_streamlines_per_tract=args.max_streamlines_per_tract
+        max_streamlines_per_tract=args.max_streamlines_per_tract,
+        full_sample_threshold=args.full_sample_threshold
     )
     
     print(f"\nTrain samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+    
+    # Create stratified epoch sampler for training (proportional sampling each epoch)
+    train_sampler = StratifiedEpochSampler(
+        train_dataset,
+        sampling_percentage=args.epoch_sampling_pct,
+        min_samples_per_class=args.min_samples_per_class,
+        full_sample_threshold=args.full_sample_threshold,
+        seed=42,
+        shuffle=True
+    )
     
     # Create dataloaders - batch_size now refers to number of streamlines
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=False,  # Must be False when using sampler
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
         collate_fn=streamline_collate_fn,
@@ -383,7 +407,8 @@ def main():
         save_dir=args.save_dir,
         patience=args.patience,
         use_amp=not args.no_amp,
-        accumulation_steps=args.accumulation_steps
+        accumulation_steps=args.accumulation_steps,
+        train_sampler=train_sampler
     )
 
 

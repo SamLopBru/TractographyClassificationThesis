@@ -18,7 +18,10 @@ class TrainConfig:
     # Data configuration
     train_dir: str = "sequences/trainset"
     val_dir: str = "sequences/validset"
-    sampling_pct: float = 0.1
+    sampling_pct: float = 0.10          # Percentage of streamlines to index per tract
+    epoch_sampling_pct: float = 0.10    # Percentage of indexed streamlines per epoch
+    min_samples_per_class: int = 10     # Minimum samples per class per epoch
+    full_sample_threshold: int = 1000   # If tract has fewer than this, take 100%
     max_streamlines_per_tract: Optional[int] = None
     
     # Model configuration
@@ -34,10 +37,10 @@ class TrainConfig:
     
     # Training configuration
     epochs: int = 100           # More epochs for convergence
-    batch_size: int = 512       # Safe for 16GB with d_model=256
+    batch_size: int = 1024       # Safe for 16GB with d_model=256
     lr: float = 3e-4            # Higher LR for larger batch
     weight_decay: float = 1e-4  # More regularization
-    accumulation_steps: int = 1
+    accumulation_steps: int = 2
     patience: int = 15          # More patience
     use_amp: bool = True        # Essential for memory
     
@@ -54,6 +57,8 @@ class TrainConfig:
             f"pooling must be 'cls', 'mean', or 'max', got {self.pooling}"
         assert 0 < self.sampling_pct <= 1, \
             f"sampling_pct must be between 0 and 1, got {self.sampling_pct}"
+        assert 0 < self.epoch_sampling_pct <= 1, \
+            f"epoch_sampling_pct must be between 0 and 1, got {self.epoch_sampling_pct}"
 
 
 # Default configuration instance
