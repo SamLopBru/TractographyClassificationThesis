@@ -324,131 +324,131 @@ def streamline_collate_fn(batch: List[Tuple[torch.Tensor, int, int]]) -> Tuple[t
     return padded_streamlines, lengths, labels
 
 
-if __name__ == "__main__":
-    import time
-    import os
-    from collections import Counter
+# if __name__ == "__main__":
+#     import time
+#     import os
+#     from collections import Counter
     
-    print("=" * 70)
-    print("STRATIFIED EPOCH SAMPLER VERIFICATION")
-    print("=" * 70)
+#     print("=" * 70)
+#     print("STRATIFIED EPOCH SAMPLER VERIFICATION")
+#     print("=" * 70)
     
-    paths = [os.path.join("sequences/testset", path) for path in os.listdir("sequences/testset")]
+#     paths = [os.path.join("sequences/testset", path) for path in os.listdir("sequences/testset")]
     
-    # Level 1: Dataset indexes 10% of all streamlines per tract
-    print("\n[1] Creating StreamlineDataset (indexing 10% per tract)...")
-    dataset = StreamlineDataset(
-        paths,
-        sampling_percentage=0.20,
-        min_streamlines=50,
-        seed=42
-    )
+#     # Level 1: Dataset indexes 10% of all streamlines per tract
+#     print("\n[1] Creating StreamlineDataset (indexing 10% per tract)...")
+#     dataset = StreamlineDataset(
+#         paths,
+#         sampling_percentage=0.40,
+#         min_streamlines=50,
+#         seed=42
+#     )
     
-    # Count indexed streamlines per class
-    indexed_per_class = Counter(item['tract_id'] for item in dataset.streamline_index)
-    print(f"\nIndexed streamlines per class:")
-    for tract_id in sorted(indexed_per_class.keys()):
-        print(f"  Class {tract_id}: {indexed_per_class[tract_id]}")
+#     # Count indexed streamlines per class
+#     indexed_per_class = Counter(item['tract_id'] for item in dataset.streamline_index)
+#     print(f"\nIndexed streamlines per class:")
+#     for tract_id in sorted(indexed_per_class.keys()):
+#         print(f"  Class {tract_id}: {indexed_per_class[tract_id]}")
     
-    # Level 2: Stratified sampler provides proportional subset each epoch
-    print("\n[2] Creating StratifiedEpochSampler (10% per class per epoch)...")
-    sampler = StratifiedEpochSampler(
-        dataset,
-        sampling_percentage=0.10,
-        min_samples_per_class=10,
-        seed=42,
-        shuffle=True
-    )
+#     # Level 2: Stratified sampler provides proportional subset each epoch
+#     print("\n[2] Creating StratifiedEpochSampler (10% per class per epoch)...")
+#     sampler = StratifiedEpochSampler(
+#         dataset,
+#         sampling_percentage=0.25,
+#         min_samples_per_class=10,
+#         seed=42,
+#         shuffle=True
+#     )
     
-    # Verify stratified sampling across multiple epochs
-    print("\n" + "=" * 70)
-    print("VERIFICATION: Class distribution across epochs")
-    print("=" * 70)
+#     # Verify stratified sampling across multiple epochs
+#     print("\n" + "=" * 70)
+#     print("VERIFICATION: Class distribution across epochs")
+#     print("=" * 70)
     
-    for epoch in range(3):
-        sampler.set_epoch(epoch)
+#     for epoch in range(3):
+#         sampler.set_epoch(epoch)
         
-        # Collect all indices for this epoch
-        epoch_indices = list(sampler)
+#         # Collect all indices for this epoch
+#         epoch_indices = list(sampler)
         
-        # Count classes in this epoch's sample
-        epoch_class_counts = Counter(
-            dataset.streamline_index[idx]['tract_id'] for idx in epoch_indices
-        )
+#         # Count classes in this epoch's sample
+#         epoch_class_counts = Counter(
+#             dataset.streamline_index[idx]['tract_id'] for idx in epoch_indices
+#         )
         
-        print(f"\n--- Epoch {epoch} ---")
-        print(f"Total samples: {len(epoch_indices)}")
-        print(f"Class distribution:")
+#         print(f"\n--- Epoch {epoch} ---")
+#         print(f"Total samples: {len(epoch_indices)}")
+#         print(f"Class distribution:")
         
-        for tract_id in sorted(epoch_class_counts.keys()):
-            count = epoch_class_counts[tract_id]
-            indexed = indexed_per_class[tract_id]
-            pct = 100.0 * count / indexed if indexed > 0 else 0
-            expected = sampler.samples_per_class[tract_id]
-            status = "✓" if count == expected else "✗"
-            print(f"  Class {tract_id}: {count:5d} / {indexed:5d} indexed "
-                  f"({pct:5.1f}%) [expected: {expected}] {status}")
+#         for tract_id in sorted(epoch_class_counts.keys()):
+#             count = epoch_class_counts[tract_id]
+#             indexed = indexed_per_class[tract_id]
+#             pct = 100.0 * count / indexed if indexed > 0 else 0
+#             expected = sampler.samples_per_class[tract_id]
+#             status = "✓" if count == expected else "✗"
+#             print(f"  Class {tract_id}: {count:5d} / {indexed:5d} indexed "
+#                   f"({pct:5.1f}%) [expected: {expected}] {status}")
     
-    # Verify different samples each epoch
-    print("\n" + "=" * 70)
-    print("VERIFICATION: Different samples each epoch")
-    print("=" * 70)
+#     # Verify different samples each epoch
+#     print("\n" + "=" * 70)
+#     print("VERIFICATION: Different samples each epoch")
+#     print("=" * 70)
     
-    sampler.set_epoch(0)
-    epoch0_indices = set(sampler)
+#     sampler.set_epoch(0)
+#     epoch0_indices = set(sampler)
     
-    sampler.set_epoch(1)
-    epoch1_indices = set(sampler)
+#     sampler.set_epoch(1)
+#     epoch1_indices = set(sampler)
     
-    sampler.set_epoch(2)
-    epoch2_indices = set(sampler)
+#     sampler.set_epoch(2)
+#     epoch2_indices = set(sampler)
     
-    overlap_01 = len(epoch0_indices & epoch1_indices)
-    overlap_02 = len(epoch0_indices & epoch2_indices)
-    overlap_12 = len(epoch1_indices & epoch2_indices)
+#     overlap_01 = len(epoch0_indices & epoch1_indices)
+#     overlap_02 = len(epoch0_indices & epoch2_indices)
+#     overlap_12 = len(epoch1_indices & epoch2_indices)
     
-    print(f"Epoch 0 samples: {len(epoch0_indices)}")
-    print(f"Epoch 1 samples: {len(epoch1_indices)}")
-    print(f"Epoch 2 samples: {len(epoch2_indices)}")
-    print(f"Overlap epoch 0-1: {overlap_01} ({100*overlap_01/len(epoch0_indices):.1f}%)")
-    print(f"Overlap epoch 0-2: {overlap_02} ({100*overlap_02/len(epoch0_indices):.1f}%)")
-    print(f"Overlap epoch 1-2: {overlap_12} ({100*overlap_12/len(epoch1_indices):.1f}%)")
+#     print(f"Epoch 0 samples: {len(epoch0_indices)}")
+#     print(f"Epoch 1 samples: {len(epoch1_indices)}")
+#     print(f"Epoch 2 samples: {len(epoch2_indices)}")
+#     print(f"Overlap epoch 0-1: {overlap_01} ({100*overlap_01/len(epoch0_indices):.1f}%)")
+#     print(f"Overlap epoch 0-2: {overlap_02} ({100*overlap_02/len(epoch0_indices):.1f}%)")
+#     print(f"Overlap epoch 1-2: {overlap_12} ({100*overlap_12/len(epoch1_indices):.1f}%)")
     
-    # Quick DataLoader test
-    print("\n" + "=" * 70)
-    print("DATALOADER TEST")
-    print("=" * 70)
+#     # Quick DataLoader test
+#     print("\n" + "=" * 70)
+#     print("DATALOADER TEST")
+#     print("=" * 70)
     
-    dataloader = DataLoader(
-        dataset,
-        batch_size=64,
-        shuffle=False,
-        sampler=sampler,
-        num_workers=4,
-        pin_memory=True,
-        collate_fn=streamline_collate_fn
-    )
+#     dataloader = DataLoader(
+#         dataset,
+#         batch_size=64,
+#         shuffle=False,
+#         sampler=sampler,
+#         num_workers=4,
+#         pin_memory=True,
+#         collate_fn=streamline_collate_fn
+#     )
     
-    sampler.set_epoch(0)
-    start = time.time()
-    batch_count = 0
-    sample_count = 0
-    batch_class_counts = Counter()
+#     sampler.set_epoch(0)
+#     start = time.time()
+#     batch_count = 0
+#     sample_count = 0
+#     batch_class_counts = Counter()
     
-    for streamlines, lengths, labels in dataloader:
-        batch_count += 1
-        sample_count += len(labels)
-        batch_class_counts.update(labels.tolist())
+#     for streamlines, lengths, labels in dataloader:
+#         batch_count += 1
+#         sample_count += len(labels)
+#         batch_class_counts.update(labels.tolist())
     
-    print(f"Processed {batch_count} batches, {sample_count} samples in {time.time() - start:.2f}s")
-    print(f"Class distribution in batches matches expected: ", end="")
+#     print(f"Processed {batch_count} batches, {sample_count} samples in {time.time() - start:.2f}s")
+#     print(f"Class distribution in batches matches expected: ", end="")
     
-    all_match = all(
-        batch_class_counts[tid] == sampler.samples_per_class[tid]
-        for tid in sampler.samples_per_class
-    )
-    print("✓ YES" if all_match else "✗ NO")
+#     all_match = all(
+#         batch_class_counts[tid] == sampler.samples_per_class[tid]
+#         for tid in sampler.samples_per_class
+#     )
+#     print("✓ YES" if all_match else "✗ NO")
     
-    print("\n" + "=" * 70)
-    print("VERIFICATION COMPLETE")
-    print("=" * 70)
+#     print("\n" + "=" * 70)
+#     print("VERIFICATION COMPLETE")
+#     print("=" * 70)

@@ -10,6 +10,9 @@ import time
 import argparse
 from typing import Dict, List, Tuple
 import json
+import math
+from datetime import datetime
+from torch.utils.tensorboard import SummaryWriter
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 
@@ -35,6 +38,8 @@ def train_epoch(
     total_loss = 0.0
     total_correct = 0
     total_samples = 0
+    total_grad_norm = 0.0
+    grad_norm_count = 0
     
     start_time = time.time()
     optimizer.zero_grad()
@@ -54,7 +59,9 @@ def train_epoch(
             
             if (batch_idx + 1) % accumulation_steps == 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                total_grad_norm += grad_norm.item()
+                grad_norm_count += 1
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -64,7 +71,9 @@ def train_epoch(
             loss.backward()
             
             if (batch_idx + 1) % accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                total_grad_norm += grad_norm.item()
+                grad_norm_count += 1
                 optimizer.step()
                 optimizer.zero_grad()
         
@@ -96,7 +105,8 @@ def train_epoch(
     
     return {
         'loss': total_loss / total_samples,
-        'accuracy': 100.0 * total_correct / total_samples
+        'accuracy': 100.0 * total_correct / total_samples,
+        'grad_norm': total_grad_norm / max(1, grad_norm_count)
     }
 
 
@@ -150,10 +160,15 @@ def train(
     patience: int = 10,
     use_amp: bool = True,
     accumulation_steps: int = 1,
-    train_sampler: StratifiedEpochSampler = None
+    train_sampler: StratifiedEpochSampler = None,
+    warmup_epochs: int = 5,
+    plateau_patience: int = 3,
+    plateau_factor: float = 0.5
 ) -> Dict[str, List[float]]:
     """
-    Full training loop with validation, early stopping, and mixed precision.
+    Full training loop with validation, early stopping, warmup, and mixed precision.
+    
+    Uses a warmup + cosine annealing schedule with ReduceLROnPlateau as backup.
     """
     model = model.to(device)
     
@@ -164,7 +179,33 @@ def train(
     
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    
+    # Primary scheduler: Linear warmup + Cosine annealing
+    # During warmup, LR increases from 0 to lr
+    # After warmup, LR decays via cosine annealing
+    def warmup_cosine_schedule(epoch):
+        if epoch < warmup_epochs:
+            # Linear warmup: gradually increase from 0 to 1
+            return (epoch + 1) / warmup_epochs
+        else:
+            # Cosine annealing after warmup
+            progress = (epoch - warmup_epochs) / max(1, epochs - warmup_epochs)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+    
+    warmup_cosine_scheduler = optim.lr_scheduler.LambdaLR(optimizer, warmup_cosine_schedule)
+    
+    # Backup scheduler: ReduceLROnPlateau for when validation loss plateaus
+    plateau_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='min',  # Monitor validation loss
+        factor=plateau_factor,
+        patience=plateau_patience,
+        verbose=True,
+        min_lr=1e-7
+    )
+    
+    print(f"Scheduler: {warmup_epochs} epochs warmup + cosine annealing")
+    print(f"Plateau LR reduction: factor={plateau_factor}, patience={plateau_patience}")
     
     # Create save directory
     os.makedirs(save_dir, exist_ok=True)
@@ -177,13 +218,30 @@ def train(
     best_val_acc = 0.0
     patience_counter = 0
     
+    # TensorBoard setup
+    run_name = datetime.now().strftime('%Y%m%d_%H%M%S')
+    writer = SummaryWriter(log_dir=os.path.join('runs', run_name))
+    print(f"TensorBoard logs: runs/{run_name}")
+    
+    # Log hyperparameters
+    hparams = {
+        'epochs': epochs,
+        'lr': lr,
+        'weight_decay': weight_decay,
+        'warmup_epochs': warmup_epochs,
+        'plateau_patience': plateau_patience,
+        'plateau_factor': plateau_factor,
+        'accumulation_steps': accumulation_steps
+    }
+    writer.add_text('Hyperparameters', str(hparams), 0)
+    
     for epoch in range(1, epochs + 1):
         # Update sampler for new epoch (different random subset)
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         
         print(f"\n{'='*60}")
-        print(f"Epoch {epoch}/{epochs} | LR: {scheduler.get_last_lr()[0]:.2e}")
+        print(f"Epoch {epoch}/{epochs} | LR: {optimizer.param_groups[0]['lr']:.2e}")
         print('='*60)
         
         # Train
@@ -198,14 +256,27 @@ def train(
         val_metrics = validate(model, val_loader, criterion, device, use_amp=use_amp)
         print(f"  Val Loss: {val_metrics['loss']:.4f} | Val Acc: {val_metrics['accuracy']:.2f}%")
         
-        # Update scheduler
-        scheduler.step()
+        # Update schedulers
+        warmup_cosine_scheduler.step()
+        plateau_scheduler.step(val_metrics['loss'])  # Plateau scheduler uses val loss
         
         # Save history
         history['train_loss'].append(train_metrics['loss'])
         history['train_acc'].append(train_metrics['accuracy'])
         history['val_loss'].append(val_metrics['loss'])
         history['val_acc'].append(val_metrics['accuracy'])
+        
+        # TensorBoard logging
+        writer.add_scalars('Loss', {
+            'train': train_metrics['loss'],
+            'val': val_metrics['loss']
+        }, epoch)
+        writer.add_scalars('Accuracy', {
+            'train': train_metrics['accuracy'],
+            'val': val_metrics['accuracy']
+        }, epoch)
+        writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
+        writer.add_scalar('Gradient_Norm', train_metrics['grad_norm'], epoch)
         
         # Save best model
         if val_metrics['accuracy'] > best_val_acc:
@@ -239,8 +310,12 @@ def train(
     with open(os.path.join(save_dir, 'history.json'), 'w') as f:
         json.dump(history, f, indent=2)
     
+    # Close TensorBoard writer
+    writer.close()
+    
     print(f"\n{'='*60}")
     print(f"Training complete! Best validation accuracy: {best_val_acc:.2f}%")
+    print(f"View TensorBoard: tensorboard --logdir=runs")
     print('='*60)
     
     return history
@@ -359,7 +434,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True,
         collate_fn=streamline_collate_fn,
-        persistent_workers=args.num_workers > 0
+        persistent_workers=False  # Disable to free RAM between epochs
     )
     val_loader = DataLoader(
         val_dataset,
@@ -368,7 +443,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True,
         collate_fn=streamline_collate_fn,
-        persistent_workers=args.num_workers > 0
+        persistent_workers=False  # Disable to free RAM between epochs
     )
     
     # Create model
@@ -408,7 +483,10 @@ def main():
         patience=args.patience,
         use_amp=not args.no_amp,
         accumulation_steps=args.accumulation_steps,
-        train_sampler=train_sampler
+        train_sampler=train_sampler,
+        warmup_epochs=cfg.warmup_epochs,
+        plateau_patience=cfg.plateau_patience,
+        plateau_factor=cfg.plateau_factor
     )
 
 

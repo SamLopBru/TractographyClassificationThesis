@@ -276,30 +276,30 @@ def create_encoder(
         raise ValueError(f"Unknown encoder type: {encoder_type}")
 
 
-if __name__ == "__main__":
-    from src.config import TrainConfig, DEFAULT_CONFIG
+# if __name__ == "__main__":
+#     from src.config import TrainConfig, DEFAULT_CONFIG
 
-    cfg = DEFAULT_CONFIG
+#     cfg = DEFAULT_CONFIG
 
-    # Test the encoders
-    batch_size = cfg.batch_size
-    seq_len = 150  # Variable length streamlines
-    input_size = cfg.input_size
-    num_classes = cfg.num_classes
+#     # Test the encoders
+#     batch_size = cfg.batch_size
+#     seq_len = 150  # Variable length streamlines
+#     input_size = cfg.input_size
+#     num_classes = cfg.num_classes
     
-    # Create sample data
-    x = torch.randn(batch_size, seq_len, input_size)
-    lengths = torch.randint(50, seq_len + 1, (batch_size,))
+#     # Create sample data
+#     x = torch.randn(batch_size, seq_len, input_size)
+#     lengths = torch.randint(50, seq_len + 1, (batch_size,))
     
-    transformer_encoder = StreamlineEncoder(
-        input_size=input_size,
-        d_model=cfg.d_model,
-        nhead=cfg.nhead,
-        num_layers=cfg.num_layers,
-        num_classes=num_classes
-    )
+#     transformer_encoder = StreamlineEncoder(
+#         input_size=input_size,
+#         d_model=cfg.d_model,
+#         nhead=cfg.nhead,
+#         num_layers=cfg.num_layers,
+#         num_classes=num_classes
+#     )
     
-    output = transformer_encoder(x, lengths=lengths)
-    print(f"  Input shape: {x.shape}")
-    print(f"  Output shape: {output.shape}")
-    print(f"  Parameters: {sum(p.numel() for p in transformer_encoder.parameters()):,}")
+#     output = transformer_encoder(x, lengths=lengths)
+#     print(f"  Input shape: {x.shape}")
+#     print(f"  Output shape: {output.shape}")
+#     print(f"  Parameters: {sum(p.numel() for p in transformer_encoder.parameters()):,}")
