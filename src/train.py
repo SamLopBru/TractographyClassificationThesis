@@ -11,6 +11,7 @@ import argparse
 from typing import Dict, List, Tuple
 import json
 import math
+import gc
 from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
 
@@ -200,7 +201,6 @@ def train(
         mode='min',  # Monitor validation loss
         factor=plateau_factor,
         patience=plateau_patience,
-        verbose=True,
         min_lr=1e-7
     )
     
@@ -305,6 +305,11 @@ def train(
             'optimizer_state_dict': optimizer.state_dict(),
             'history': history
         }, os.path.join(save_dir, 'latest_checkpoint.pt'))
+        
+        # Memory cleanup at end of each epoch
+        gc.collect()
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
     
     # Save training history
     with open(os.path.join(save_dir, 'history.json'), 'w') as f:

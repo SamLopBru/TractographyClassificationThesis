@@ -468,7 +468,7 @@ def main():
                         help='Directory containing test HDF5 files')
     parser.add_argument('--checkpoint', type=str, default='checkpoints/best_model.pt',
                         help='Path to model checkpoint')
-    parser.add_argument('--output_dir', type=str, default='images/test_results',
+    parser.add_argument('--output_dir', type=str, default='tests/test_results',
                         help='Directory to save results')
     parser.add_argument('--batch_size', type=int, default=cfg.batch_size,
                         help='Batch size for inference')
