@@ -38,7 +38,7 @@ class TrainConfig:
     # Training configuration
     epochs: int = 100           # More epochs for convergence
     batch_size: int = 1024      # Safe for 16GB with d_model=256
-    lr: float = 3e-4            # Higher LR for larger batch
+    lr: float = 1e-4            # Lower LR for stability after warmup
     weight_decay: float = 1e-4  # More regularization
     accumulation_steps: int = 2
     patience: int = 15          # Early Stop patience

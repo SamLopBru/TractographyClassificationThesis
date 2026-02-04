@@ -12,8 +12,10 @@ from typing import Dict, List, Tuple
 import json
 import math
 import gc
+import numpy as np
 from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
+from sklearn.metrics import f1_score
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 
@@ -61,9 +63,15 @@ def train_epoch(
             if (batch_idx + 1) % accumulation_steps == 0:
                 scaler.unscale_(optimizer)
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                total_grad_norm += grad_norm.item()
-                grad_norm_count += 1
-                scaler.step(optimizer)
+                
+                # Check for inf/nan gradients and skip if found
+                if torch.isfinite(grad_norm):
+                    total_grad_norm += grad_norm.item()
+                    grad_norm_count += 1
+                    scaler.step(optimizer)
+                else:
+                    print(f"  ⚠ Warning: Skipping batch {batch_idx+1} due to inf/nan gradients")
+                
                 scaler.update()
                 optimizer.zero_grad()
         else:
@@ -73,9 +81,15 @@ def train_epoch(
             
             if (batch_idx + 1) % accumulation_steps == 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                total_grad_norm += grad_norm.item()
-                grad_norm_count += 1
-                optimizer.step()
+                
+                # Check for inf/nan gradients and skip if found
+                if torch.isfinite(grad_norm):
+                    total_grad_norm += grad_norm.item()
+                    grad_norm_count += 1
+                    optimizer.step()
+                else:
+                    print(f"  ⚠ Warning: Skipping batch {batch_idx+1} due to inf/nan gradients")
+                
                 optimizer.zero_grad()
         
         # Metrics (multiply back for logging)
@@ -119,11 +133,14 @@ def validate(
     device: torch.device,
     use_amp: bool = True
 ) -> Dict[str, float]:
-    """Validate the model."""
+    """Validate the model and compute metrics including Macro F1."""
     model.eval()
     total_loss = 0.0
     total_correct = 0
     total_samples = 0
+    
+    all_labels = []
+    all_preds = []
     
     for streamlines, lengths, labels in dataloader:
         streamlines = streamlines.to(device)
@@ -142,10 +159,18 @@ def validate(
         predictions = logits.argmax(dim=1)
         total_correct += (predictions == labels).sum().item()
         total_samples += labels.size(0)
+        
+        # Collect for F1 computation
+        all_labels.extend(labels.cpu().numpy())
+        all_preds.extend(predictions.cpu().numpy())
+    
+    # Compute Macro F1 (treats all classes equally)
+    macro_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0) * 100
     
     return {
         'loss': total_loss / total_samples,
-        'accuracy': 100.0 * total_correct / total_samples
+        'accuracy': 100.0 * total_correct / total_samples,
+        'macro_f1': macro_f1
     }
 
 
@@ -182,16 +207,18 @@ def train(
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     
     # Primary scheduler: Linear warmup + Cosine annealing
-    # During warmup, LR increases from 0 to lr
-    # After warmup, LR decays via cosine annealing
+    # During warmup, LR increases from 10% to 100%
+    # After warmup, LR decays via cosine annealing to 1%
     def warmup_cosine_schedule(epoch):
         if epoch < warmup_epochs:
-            # Linear warmup: gradually increase from 0 to 1
-            return (epoch + 1) / warmup_epochs
+            # Linear warmup: start at 10% and increase to 100%
+            warmup_factor = 0.1 + 0.9 * (epoch / warmup_epochs)
+            return warmup_factor
         else:
-            # Cosine annealing after warmup
+            # Cosine annealing after warmup: decay from 100% to 1%
             progress = (epoch - warmup_epochs) / max(1, epochs - warmup_epochs)
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
+            cosine_factor = 0.01 + 0.99 * 0.5 * (1.0 + math.cos(math.pi * progress))
+            return cosine_factor
     
     warmup_cosine_scheduler = optim.lr_scheduler.LambdaLR(optimizer, warmup_cosine_schedule)
     
@@ -212,7 +239,7 @@ def train(
     
     history = {
         'train_loss': [], 'train_acc': [],
-        'val_loss': [], 'val_acc': []
+        'val_loss': [], 'val_acc': [], 'val_f1': []
     }
     
     best_val_acc = 0.0
@@ -254,7 +281,7 @@ def train(
         
         # Validate
         val_metrics = validate(model, val_loader, criterion, device, use_amp=use_amp)
-        print(f"  Val Loss: {val_metrics['loss']:.4f} | Val Acc: {val_metrics['accuracy']:.2f}%")
+        print(f"  Val Loss: {val_metrics['loss']:.4f} | Val Acc: {val_metrics['accuracy']:.2f}% | Val F1: {val_metrics['macro_f1']:.2f}%")
         
         # Update schedulers
         warmup_cosine_scheduler.step()
@@ -265,6 +292,7 @@ def train(
         history['train_acc'].append(train_metrics['accuracy'])
         history['val_loss'].append(val_metrics['loss'])
         history['val_acc'].append(val_metrics['accuracy'])
+        history['val_f1'].append(val_metrics['macro_f1'])
         
         # TensorBoard logging
         writer.add_scalars('Loss', {
@@ -275,6 +303,7 @@ def train(
             'train': train_metrics['accuracy'],
             'val': val_metrics['accuracy']
         }, epoch)
+        writer.add_scalar('Val_Macro_F1', val_metrics['macro_f1'], epoch)
         writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
         writer.add_scalar('Gradient_Norm', train_metrics['grad_norm'], epoch)
         
