@@ -19,7 +19,7 @@ class TrainConfig:
     train_dir: str = "sequences/trainset"
     val_dir: str = "sequences/validset"
     sampling_pct: float = 0.10          # Percentage of streamlines to index per tract
-    epoch_sampling_pct: float = 0.25    # Percentage of indexed streamlines per epoch
+    epoch_sampling_pct: float = 0.05    # Percentage of indexed streamlines per epoch
     min_samples_per_class: int = 10     # Minimum samples per class per epoch
     full_sample_threshold: int = 1000   # If tract has fewer than this, take 100%
     max_streamlines_per_tract: Optional[int] = None
@@ -36,19 +36,19 @@ class TrainConfig:
     pooling: str = "mean"       # "cls", "mean", or "max"
     
     # Training configuration
-    epochs: int = 100           # More epochs for convergence
-    batch_size: int = 1024      # Safe for 16GB with d_model=256
+    epochs: int = 20            # More epochs for convergence
+    batch_size: int = 2048      # Safe for 16GB with d_model=256
     lr: float = 1e-4            # Lower LR for stability after warmup
     weight_decay: float = 1e-4  # More regularization
-    accumulation_steps: int = 2
-    patience: int = 15          # Early Stop patience
+    accumulation_steps: int = 1
+    patience: int = 5           # Early Stop patience
     use_amp: bool = True        # Essential for memory
     warmup_epochs: int = 5      # Linear warmup epochs
     plateau_patience: int = 3   # Epochs before LR reduction on plateau
     plateau_factor: float = 0.5 # LR reduction factor on plateau
     
     # System configuration
-    num_workers: int = 4        # Lower to reduce RAM (each worker copies the index)
+    num_workers: int = 8        
     save_dir: str = "checkpoints"
     log_interval: int = 50      # Less frequent logging
     

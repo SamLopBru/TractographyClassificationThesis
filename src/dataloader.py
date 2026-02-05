@@ -241,6 +241,10 @@ class StreamlineDataset(Dataset):
         self.file_paths_lookup = list(hdf5_file_paths)
         self.file_path_to_id = {path: i for i, path in enumerate(self.file_paths_lookup)}
         
+        # HDF5 file handle cache (opened lazily, per-worker for multiprocessing safety)
+        self._file_handles = {}
+        self._worker_id = None  # Track which worker owns these handles
+        
         # Build index of sampled streamlines across all files
         # Stored as NumPy structured array for memory efficiency
         self.streamline_index = None  # Will be np.ndarray with INDEX_DTYPE
@@ -316,6 +320,43 @@ class StreamlineDataset(Dataset):
     def __len__(self):
         return len(self.streamline_index)
     
+    def _get_current_worker_id(self) -> int:
+        """Get the current DataLoader worker ID, or -1 for main process."""
+        worker_info = torch.utils.data.get_worker_info()
+        return worker_info.id if worker_info is not None else -1
+    
+    def _get_file_handle(self, file_id: int):
+        """Get a cached file handle, opening it if necessary.
+        
+        Handles are cached per-worker to be multiprocessing safe.
+        """
+        current_worker = self._get_current_worker_id()
+        
+        # If worker changed (shouldn't happen, but be safe), clear cache
+        if self._worker_id is not None and self._worker_id != current_worker:
+            self._close_file_handles()
+        self._worker_id = current_worker
+        
+        # Open file if not cached
+        if file_id not in self._file_handles:
+            file_path = self.file_paths_lookup[file_id]
+            self._file_handles[file_id] = h5py.File(file_path, 'r')
+        
+        return self._file_handles[file_id]
+    
+    def _close_file_handles(self):
+        """Close all cached file handles."""
+        for handle in self._file_handles.values():
+            try:
+                handle.close()
+            except:
+                pass
+        self._file_handles = {}
+    
+    def __del__(self):
+        """Cleanup file handles on deletion."""
+        self._close_file_handles()
+    
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int, int]:
         """
         Get a single streamline.
@@ -327,19 +368,18 @@ class StreamlineDataset(Dataset):
         """
         item = self.streamline_index[idx]
         
-        # Lookup file path from ID
-        file_path = self.file_paths_lookup[item['file_id']]
+        # Get cached file handle (much faster than opening/closing each time)
+        file_handle = self._get_file_handle(int(item['file_id']))
         group_name = f"tract_{item['group_id']}"
         
-        with h5py.File(file_path, 'r') as f:
-            tract_group = f[group_name]
-            
-            # Get the single streamline
-            streamline = tract_group['streamlines'][item['streamline_idx']]  # (max_len, 5)
-            length = int(item['length'])
-            
-            # Trim to actual length (remove padding)
-            streamline = streamline[:length]
+        tract_group = file_handle[group_name]
+        
+        # Get the single streamline
+        streamline = tract_group['streamlines'][item['streamline_idx']]  # (max_len, 5)
+        length = int(item['length'])
+        
+        # Trim to actual length (remove padding)
+        streamline = streamline[:length]
         
         return (
             torch.from_numpy(streamline.astype(np.float32)),

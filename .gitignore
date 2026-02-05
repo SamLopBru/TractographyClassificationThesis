@@ -9,8 +9,21 @@ wheels/
 # Virtual environments
 .venv
 
-# Data files
+# Data files (large binary data)
 *.hdf5
-*.csv
-*.png
+sequences/
+
+# Model checkpoints (large, regeneratable)
+checkpoints/
 *.pt
+*.pth
+
+# TensorBoard logs (can be large, regeneratable)
+runs/
+
+# Images generated during experiments
+images/*.png
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+

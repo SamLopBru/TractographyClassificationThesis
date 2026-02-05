@@ -13,9 +13,23 @@ import json
 import math
 import gc
 import numpy as np
+import csv
 from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import f1_score
+
+# Enable cuDNN benchmarking for faster training (finds optimal algorithms for your hardware)
+torch.backends.cudnn.benchmark = True
+
+# Enable TensorFloat-32 for faster matmul on Ampere+ GPUs (RTX 30xx, 40xx, 50xx)
+torch.set_float32_matmul_precision('high')
+
+# Fix random seeds for reproducibility
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 
@@ -48,9 +62,10 @@ def train_epoch(
     optimizer.zero_grad()
     
     for batch_idx, (streamlines, lengths, labels) in enumerate(dataloader):
-        streamlines = streamlines.to(device)
-        lengths = lengths.to(device)
-        labels = labels.to(device)
+        # Use non_blocking=True with pin_memory for async H2D transfers
+        streamlines = streamlines.to(device, non_blocking=True)
+        lengths = lengths.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
         
         # Forward pass with optional mixed precision
         if use_amp and scaler is not None:
@@ -143,9 +158,10 @@ def validate(
     all_preds = []
     
     for streamlines, lengths, labels in dataloader:
-        streamlines = streamlines.to(device)
-        lengths = lengths.to(device)
-        labels = labels.to(device)
+        # Use non_blocking=True with pin_memory for async H2D transfers
+        streamlines = streamlines.to(device, non_blocking=True)
+        lengths = lengths.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
         
         if use_amp:
             with autocast(device_type='cuda', dtype=torch.float16):
@@ -189,12 +205,16 @@ def train(
     train_sampler: StratifiedEpochSampler = None,
     warmup_epochs: int = 5,
     plateau_patience: int = 3,
-    plateau_factor: float = 0.5
+    plateau_factor: float = 0.5,
+    train_dataset: 'StreamlineDataset' = None,
+    num_classes: int = 32,
+    label_smoothing: float = 0.1
 ) -> Dict[str, List[float]]:
     """
     Full training loop with validation, early stopping, warmup, and mixed precision.
     
     Uses a warmup + cosine annealing schedule with ReduceLROnPlateau as backup.
+    Features: class weighting for imbalanced data, label smoothing for better generalization.
     """
     model = model.to(device)
     
@@ -203,7 +223,10 @@ def train(
     if use_amp:
         print("Using mixed precision (FP16) training")
     
-    criterion = nn.CrossEntropyLoss()
+    # Loss function with label smoothing for better generalization
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    print(f"Using CrossEntropyLoss with label_smoothing={label_smoothing}")
+    
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     
     # Primary scheduler: Linear warmup + Cosine annealing
@@ -242,7 +265,7 @@ def train(
         'val_loss': [], 'val_acc': [], 'val_f1': []
     }
     
-    best_val_acc = 0.0
+    best_val_f1 = 0.0
     patience_counter = 0
     
     # TensorBoard setup
@@ -307,20 +330,21 @@ def train(
         writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
         writer.add_scalar('Gradient_Norm', train_metrics['grad_norm'], epoch)
         
-        # Save best model
-        if val_metrics['accuracy'] > best_val_acc:
-            best_val_acc = val_metrics['accuracy']
+        # Save best model (based on Macro F1 for better handling of imbalanced classes)
+        if val_metrics['macro_f1'] > best_val_f1:
+            best_val_f1 = val_metrics['macro_f1']
             patience_counter = 0
             
             checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'val_accuracy': best_val_acc,
+                'val_accuracy': val_metrics['accuracy'],
+                'val_macro_f1': best_val_f1,
                 'history': history
             }
             torch.save(checkpoint, os.path.join(save_dir, 'best_model.pt'))
-            print(f"  ✓ Saved new best model (Val Acc: {best_val_acc:.2f}%)")
+            print(f"  ✓ Saved new best model (Val F1: {best_val_f1:.2f}%, Acc: {val_metrics['accuracy']:.2f}%)")
         else:
             patience_counter += 1
             if patience_counter >= patience:
@@ -348,11 +372,73 @@ def train(
     writer.close()
     
     print(f"\n{'='*60}")
-    print(f"Training complete! Best validation accuracy: {best_val_acc:.2f}%")
+    print(f"Training complete! Best validation Macro F1: {best_val_f1:.2f}%")
     print(f"View TensorBoard: tensorboard --logdir=runs")
     print('='*60)
     
     return history
+
+
+def log_experiment(
+    experiment_name: str,
+    encoder_type: str,
+    history: Dict[str, List[float]],
+    params: Dict,
+    csv_path: str = "experiments.csv"
+):
+    """
+    Log experiment results to a CSV file for comparison.
+    
+    Args:
+        experiment_name: Name/description of this experiment
+        encoder_type: 'transformer' or 'lstm'
+        history: Training history dict with loss, accuracy, f1
+        params: Dict of hyperparameters
+        csv_path: Path to CSV file (created if doesn't exist)
+    """
+    # Get best metrics
+    best_val_f1 = max(history['val_f1']) if history['val_f1'] else 0
+    best_val_acc = max(history['val_acc']) if history['val_acc'] else 0
+    best_epoch = history['val_f1'].index(best_val_f1) + 1 if history['val_f1'] else 0
+    final_train_loss = history['train_loss'][-1] if history['train_loss'] else 0
+    final_val_loss = history['val_loss'][-1] if history['val_loss'] else 0
+    
+    # Create row
+    row = {
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'experiment': experiment_name,
+        'encoder_type': encoder_type,
+        'best_val_f1': f"{best_val_f1:.2f}",
+        'best_val_acc': f"{best_val_acc:.2f}",
+        'best_epoch': best_epoch,
+        'total_epochs': len(history['train_loss']),
+        'final_train_loss': f"{final_train_loss:.4f}",
+        'final_val_loss': f"{final_val_loss:.4f}",
+        'd_model': params.get('d_model', ''),
+        'dim_feedforward': params.get('dim_feedforward', ''),
+        'num_layers': params.get('num_layers', ''),
+        'nhead': params.get('nhead', ''),
+        'lr': params.get('lr', ''),
+        'batch_size': params.get('batch_size', ''),
+        'dropout': params.get('dropout', ''),
+        'pooling': params.get('pooling', ''),
+        'num_workers': params.get('num_workers', ''),
+        'warmup_epochs': params.get('warmup_epochs', ''),
+        'plateau_patience': params.get('plateau_patience', ''),
+        'plateau_factor': params.get('plateau_factor', ''),
+        'parameters': params.get('parameters', ''),
+    }
+    
+    # Check if file exists to determine if we need headers
+    file_exists = os.path.exists(csv_path)
+    
+    with open(csv_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=row.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+    
+    print(f"\n📊 Experiment logged to {csv_path}")
 
 
 def main():
@@ -468,8 +554,10 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True,
         collate_fn=streamline_collate_fn,
-        persistent_workers=False  # Disable to free RAM between epochs
+        persistent_workers=True,  # Disable to free RAM between epochs
+        prefetch_factor=2
     )
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
@@ -477,7 +565,8 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True,
         collate_fn=streamline_collate_fn,
-        persistent_workers=False  # Disable to free RAM between epochs
+        persistent_workers=True,  # Disable to free RAM between epochs
+        prefetch_factor=2
     )
     
     # Create model
@@ -504,6 +593,11 @@ def main():
     print(f"\nModel: {args.encoder_type}")
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
+    # Compile model for faster execution (PyTorch 2.0+)
+    # Use dynamic=True for variable-length streamline inputs
+    model = torch.compile(model, dynamic=True)
+    print("Model compiled with torch.compile(dynamic=True)")
+    
     # Train
     history = train(
         model=model,
@@ -520,7 +614,32 @@ def main():
         train_sampler=train_sampler,
         warmup_epochs=cfg.warmup_epochs,
         plateau_patience=cfg.plateau_patience,
-        plateau_factor=cfg.plateau_factor
+        plateau_factor=cfg.plateau_factor,
+        train_dataset=train_dataset,
+        num_classes=args.num_classes
+    )
+    
+    # Log experiment results to CSV
+    log_experiment(
+        experiment_name=f"{args.encoder_type}_d{args.d_model}_L{args.num_layers}",
+        encoder_type=args.encoder_type,
+        history=history,
+        params={
+            'd_model': args.d_model,
+            'num_layers': args.num_layers,
+            'nhead': args.nhead,
+            'lr': args.lr,
+            'batch_size': args.batch_size,
+            'dropout': args.dropout,
+            'pooling': args.pooling,
+            'parameters': sum(p.numel() for p in model.parameters()),
+            'dim_feedforward': args.dim_feedforward,
+            'num_workers': args.num_workers,
+            'warmup_epochs': args.warmup_epochs,
+            'plateau_patience': args.plateau_patience,
+            'plateau_factor': args.plateau_factor,
+        },
+        csv_path="experiments.csv"
     )
 
 
