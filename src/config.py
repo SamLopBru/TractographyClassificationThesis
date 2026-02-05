@@ -38,14 +38,19 @@ class TrainConfig:
     # Training configuration
     epochs: int = 20            # More epochs for convergence
     batch_size: int = 2048      # Safe for 16GB with d_model=256
-    lr: float = 1e-4            # Lower LR for stability after warmup
-    weight_decay: float = 1e-4  # More regularization
+    base_lr: float = 1e-4       # Base LR (will be scaled by batch size)
+    lr_scale_with_batch: bool = True  # Scale LR with sqrt(batch_size/256)
+    weight_decay_transformer: float = 1e-4  # Weight decay for Transformer
+    weight_decay_lstm: float = 1e-5         # Weight decay for LSTM (lower)
     accumulation_steps: int = 1
     patience: int = 5           # Early Stop patience
     use_amp: bool = True        # Essential for memory
-    warmup_epochs: int = 5      # Linear warmup epochs
+    warmup_steps: int = 500     # Warmup by steps (more consistent than epochs)
     plateau_patience: int = 3   # Epochs before LR reduction on plateau
     plateau_factor: float = 0.5 # LR reduction factor on plateau
+    use_ema: bool = True        # Use Exponential Moving Average
+    ema_decay: float = 0.999    # EMA decay factor
+    validate_every: int = 2     # Validate every N epochs (2 during warmup)
     
     # System configuration
     num_workers: int = 8        

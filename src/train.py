@@ -8,10 +8,11 @@ import os
 import sys
 import time
 import argparse
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import json
 import math
 import gc
+import copy
 import numpy as np
 import csv
 from datetime import datetime
@@ -34,7 +35,7 @@ if torch.cuda.is_available():
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 
 from src.encoder import StreamlineEncoder, LightweightStreamlineEncoder
-from src.dataloader import StreamlineDataset, StratifiedEpochSampler, streamline_collate_fn
+from src.dataloader import StreamlineDataset, StratifiedEpochSampler, EpochSubsetSampler, streamline_collate_fn
 from src.config import TrainConfig, DEFAULT_CONFIG
 
 
@@ -48,9 +49,12 @@ def train_epoch(
     scaler: GradScaler = None,
     use_amp: bool = True,
     accumulation_steps: int = 1,
-    log_interval: int = 10
+    log_interval: int = 10,
+    scheduler: optim.lr_scheduler._LRScheduler = None,
+    ema_model: nn.Module = None,
+    ema_decay: float = 0.999
 ) -> Dict[str, float]:
-    """Train for one epoch with optional mixed precision and gradient accumulation."""
+    """Train for one epoch with optional mixed precision, gradient accumulation, and EMA."""
     model.train()
     total_loss = 0.0
     total_correct = 0
@@ -89,6 +93,16 @@ def train_epoch(
                 
                 scaler.update()
                 optimizer.zero_grad()
+                
+                # Step-based LR scheduler update
+                if scheduler is not None:
+                    scheduler.step()
+                
+                # EMA update
+                if ema_model is not None:
+                    with torch.no_grad():
+                        for ema_param, model_param in zip(ema_model.parameters(), model.parameters()):
+                            ema_param.data.mul_(ema_decay).add_(model_param.data, alpha=1 - ema_decay)
         else:
             logits = model(streamlines, lengths=lengths)
             loss = criterion(logits, labels) / accumulation_steps
@@ -106,6 +120,16 @@ def train_epoch(
                     print(f"  ⚠ Warning: Skipping batch {batch_idx+1} due to inf/nan gradients")
                 
                 optimizer.zero_grad()
+                
+                # Step-based LR scheduler update
+                if scheduler is not None:
+                    scheduler.step()
+                
+                # EMA update
+                if ema_model is not None:
+                    with torch.no_grad():
+                        for ema_param, model_param in zip(ema_model.parameters(), model.parameters()):
+                            ema_param.data.mul_(ema_decay).add_(model_param.data, alpha=1 - ema_decay)
         
         # Metrics (multiply back for logging)
         total_loss += loss.item() * accumulation_steps * labels.size(0)
@@ -203,19 +227,27 @@ def train(
     use_amp: bool = True,
     accumulation_steps: int = 1,
     train_sampler: StratifiedEpochSampler = None,
-    warmup_epochs: int = 5,
+    val_sampler: 'StratifiedEpochSampler' = None,
+    warmup_steps: int = 500,
     plateau_patience: int = 3,
     plateau_factor: float = 0.5,
     train_dataset: 'StreamlineDataset' = None,
     num_classes: int = 32,
     label_smoothing: float = 0.1,
-    resume_checkpoint: str = None
+    resume_checkpoint: str = None,
+    use_ema: bool = True,
+    ema_decay: float = 0.999,
+    validate_every: int = 1
 ) -> Dict[str, List[float]]:
     """
     Full training loop with validation, early stopping, warmup, and mixed precision.
     
-    Uses a warmup + cosine annealing schedule with ReduceLROnPlateau as backup.
-    Features: class weighting for imbalanced data, label smoothing for better generalization.
+    Features:
+    - LR warmup by steps (not epochs) for consistent warmup across batch sizes
+    - Cosine annealing after warmup with ReduceLROnPlateau as backup
+    - EMA (Exponential Moving Average) for better final model quality
+    - Validation scheduling (less frequent during early training)
+    - Label smoothing for better generalization
     """
     model = model.to(device)
     
@@ -230,21 +262,21 @@ def train(
     
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     
-    # Primary scheduler: Linear warmup + Cosine annealing
-    # During warmup, LR increases from 10% to 100%
-    # After warmup, LR decays via cosine annealing to 1%
-    def warmup_cosine_schedule(epoch):
-        if epoch < warmup_epochs:
+    # Calculate total steps for warmup scheduling
+    steps_per_epoch = len(train_loader)
+    total_steps = epochs * steps_per_epoch
+    
+    # Step-based warmup + cosine annealing scheduler
+    def warmup_cosine_schedule_fn(current_step):
+        if current_step < warmup_steps:
             # Linear warmup: start at 10% and increase to 100%
-            warmup_factor = 0.1 + 0.9 * (epoch / warmup_epochs)
-            return warmup_factor
+            return 0.1 + 0.9 * (current_step / warmup_steps)
         else:
             # Cosine annealing after warmup: decay from 100% to 1%
-            progress = (epoch - warmup_epochs) / max(1, epochs - warmup_epochs)
-            cosine_factor = 0.01 + 0.99 * 0.5 * (1.0 + math.cos(math.pi * progress))
-            return cosine_factor
+            progress = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return 0.01 + 0.99 * 0.5 * (1.0 + math.cos(math.pi * progress))
     
-    warmup_cosine_scheduler = optim.lr_scheduler.LambdaLR(optimizer, warmup_cosine_schedule)
+    warmup_cosine_scheduler = optim.lr_scheduler.LambdaLR(optimizer, warmup_cosine_schedule_fn)
     
     # Backup scheduler: ReduceLROnPlateau for when validation loss plateaus
     plateau_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -255,8 +287,17 @@ def train(
         min_lr=1e-7
     )
     
-    print(f"Scheduler: {warmup_epochs} epochs warmup + cosine annealing")
+    print(f"Scheduler: {warmup_steps} steps warmup + cosine annealing (total {total_steps} steps)")
     print(f"Plateau LR reduction: factor={plateau_factor}, patience={plateau_patience}")
+    
+    # EMA model for better final quality
+    ema_model = None
+    if use_ema:
+        ema_model = copy.deepcopy(model)
+        ema_model.eval()
+        for param in ema_model.parameters():
+            param.requires_grad = False
+        print(f"Using EMA with decay={ema_decay}")
     
     # Create save directory
     os.makedirs(save_dir, exist_ok=True)
@@ -309,12 +350,18 @@ def train(
         'epochs': epochs,
         'lr': lr,
         'weight_decay': weight_decay,
-        'warmup_epochs': warmup_epochs,
+        'warmup_steps': warmup_steps,
         'plateau_patience': plateau_patience,
         'plateau_factor': plateau_factor,
-        'accumulation_steps': accumulation_steps
+        'accumulation_steps': accumulation_steps,
+        'use_ema': use_ema,
+        'ema_decay': ema_decay,
+        'validate_every': validate_every
     }
     writer.add_text('Hyperparameters', str(hparams), 0)
+    
+    # Calculate warmup epoch threshold for validation scheduling
+    warmup_epoch_threshold = max(1, warmup_steps // steps_per_epoch)
     
     for epoch in range(start_epoch, epochs + 1):
         # Update sampler for new epoch (different random subset)
@@ -327,23 +374,46 @@ def train(
         
         epoch_start_time = time.time()
         
-        # Train
+        # Train (scheduler steps inside train_epoch, not here)
         train_metrics = train_epoch(
             model, train_loader, criterion, optimizer, device, epoch,
             scaler=scaler, use_amp=use_amp,
-            accumulation_steps=accumulation_steps
+            accumulation_steps=accumulation_steps,
+            scheduler=warmup_cosine_scheduler,
+            ema_model=ema_model,
+            ema_decay=ema_decay
         )
         print(f"\n  Train Loss: {train_metrics['loss']:.4f} | Train Acc: {train_metrics['accuracy']:.2f}%")
         
-        # Validate
-        val_metrics = validate(model, val_loader, criterion, device, use_amp=use_amp)
+        # Update validation sampler for each epoch
+        if val_sampler is not None:
+            val_sampler.set_epoch(epoch)
+        
+        # Validation scheduling: validate less frequently during warmup
+        current_validate_every = validate_every * 2 if epoch <= warmup_epoch_threshold else validate_every
+        should_validate = (epoch % current_validate_every == 0) or (epoch == epochs)
+        
+        if should_validate:
+            # Validate with regular model
+            val_metrics = validate(model, val_loader, criterion, device, use_amp=use_amp)
+            
+            # If using EMA, also validate with EMA model and report
+            if ema_model is not None:
+                ema_val_metrics = validate(ema_model, val_loader, criterion, device, use_amp=use_amp)
+                print(f"  [EMA] Val Loss: {ema_val_metrics['loss']:.4f} | Val Acc: {ema_val_metrics['accuracy']:.2f}% | Val F1: {ema_val_metrics['macro_f1']:.2f}%")
+        else:
+            # Use placeholder metrics when skipping validation
+            val_metrics = {'loss': history['val_loss'][-1] if history['val_loss'] else 0, 
+                          'accuracy': history['val_acc'][-1] if history['val_acc'] else 0,
+                          'macro_f1': history['val_f1'][-1] if history['val_f1'] else 0}
+            print(f"  [Skipping validation this epoch]")
         
         epoch_time = time.time() - epoch_start_time
         print(f"  Val Loss: {val_metrics['loss']:.4f} | Val Acc: {val_metrics['accuracy']:.2f}% | Val F1: {val_metrics['macro_f1']:.2f}% | Time: {epoch_time:.1f}s")
         
-        # Update schedulers
-        warmup_cosine_scheduler.step()
-        plateau_scheduler.step(val_metrics['loss'])  # Plateau scheduler uses val loss
+        # Plateau scheduler uses val loss (only on validation epochs)
+        if should_validate:
+            plateau_scheduler.step(val_metrics['loss'])
         
         # Save history
         history['train_loss'].append(train_metrics['loss'])
@@ -374,12 +444,18 @@ def train(
             checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
+                'ema_model_state_dict': ema_model.state_dict() if ema_model is not None else None,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_accuracy': val_metrics['accuracy'],
                 'val_macro_f1': best_val_f1,
                 'history': history
             }
             torch.save(checkpoint, os.path.join(save_dir, 'best_model.pt'))
+            
+            # Also save EMA model separately if available
+            if ema_model is not None:
+                torch.save({'model_state_dict': ema_model.state_dict()}, 
+                          os.path.join(save_dir, 'best_model_ema.pt'))
             print(f"  ✓ Saved new best model (Val F1: {best_val_f1:.2f}%, Acc: {val_metrics['accuracy']:.2f}%)")
         else:
             patience_counter += 1
@@ -391,6 +467,7 @@ def train(
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
+            'ema_model_state_dict': ema_model.state_dict() if ema_model is not None else None,
             'optimizer_state_dict': optimizer.state_dict(),
             'warmup_cosine_scheduler_state': warmup_cosine_scheduler.state_dict(),
             'plateau_scheduler_state': plateau_scheduler.state_dict(),
@@ -529,16 +606,20 @@ def main():
                         help='Number of epochs')
     parser.add_argument('--batch_size', type=int, default=cfg.batch_size,
                         help='Batch size (streamlines)')
-    parser.add_argument('--lr', type=float, default=cfg.lr,
-                        help='Learning rate')
-    parser.add_argument('--weight_decay', type=float, default=cfg.weight_decay,
-                        help='Weight decay')
+    parser.add_argument('--base_lr', type=float, default=cfg.base_lr,
+                        help='Base learning rate (will be scaled with batch size if enabled)')
+    parser.add_argument('--no_lr_scaling', action='store_true',
+                        help='Disable LR scaling with batch size')
     parser.add_argument('--accumulation_steps', type=int, default=cfg.accumulation_steps,
                         help='Gradient accumulation steps')
     parser.add_argument('--patience', type=int, default=cfg.patience,
                         help='Early stopping patience')
     parser.add_argument('--no_amp', action='store_true',
                         help='Disable mixed precision')
+    parser.add_argument('--no_ema', action='store_true',
+                        help='Disable Exponential Moving Average')
+    parser.add_argument('--validate_every', type=int, default=cfg.validate_every,
+                        help='Validate every N epochs')
     
     # System arguments
     parser.add_argument('--num_workers', type=int, default=cfg.num_workers,
@@ -590,6 +671,16 @@ def main():
         shuffle=True
     )
     
+    # Create stratified validation sampler (20% per class for reliable Macro F1)
+    val_sampler = StratifiedEpochSampler(
+        val_dataset,
+        sampling_percentage=0.10,  
+        min_samples_per_class=10,
+        full_sample_threshold=args.full_sample_threshold,
+        seed=42,
+        shuffle=False  # Keep validation deterministic
+    )
+    
     # Create dataloaders - batch_size now refers to number of streamlines
     train_loader = DataLoader(
         train_dataset,
@@ -599,7 +690,7 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True,
         collate_fn=streamline_collate_fn,
-        persistent_workers=True,  # Disable to free RAM between epochs
+        persistent_workers=False,  # Disable to free RAM between epochs
         prefetch_factor=2
     )
 
@@ -607,10 +698,11 @@ def main():
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
+        sampler=val_sampler,  # Use subset sampler for faster validation
         num_workers=args.num_workers,
         pin_memory=True,
         collate_fn=streamline_collate_fn,
-        persistent_workers=True,  # Disable to free RAM between epochs
+        persistent_workers=False,  # Disable to free RAM between epochs
         prefetch_factor=2
     )
     
@@ -643,6 +735,23 @@ def main():
     model = torch.compile(model, dynamic=True)
     print("Model compiled with torch.compile(dynamic=True)")
     
+    # Calculate LR with optional batch size scaling
+    if args.no_lr_scaling:
+        lr = args.base_lr
+        print(f"Using base LR: {lr:.2e}")
+    else:
+        # Linear scaling rule: LR scales with sqrt(batch_size / 256)
+        lr = args.base_lr * math.sqrt(args.batch_size / 256)
+        print(f"LR scaled with batch size: {args.base_lr:.2e} * sqrt({args.batch_size}/256) = {lr:.2e}")
+    
+    # Architecture-specific weight decay
+    if args.encoder_type == 'transformer':
+        weight_decay = cfg.weight_decay_transformer
+        print(f"Using Transformer weight decay: {weight_decay:.2e}")
+    else:
+        weight_decay = cfg.weight_decay_lstm
+        print(f"Using LSTM weight decay: {weight_decay:.2e}")
+    
     # Train
     history = train(
         model=model,
@@ -650,19 +759,23 @@ def main():
         val_loader=val_loader,
         device=device,
         epochs=args.epochs,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
+        lr=lr,
+        weight_decay=weight_decay,
         save_dir=args.save_dir,
         patience=args.patience,
         use_amp=not args.no_amp,
         accumulation_steps=args.accumulation_steps,
         train_sampler=train_sampler,
-        warmup_epochs=cfg.warmup_epochs,
+        val_sampler=val_sampler,
+        warmup_steps=cfg.warmup_steps,
         plateau_patience=cfg.plateau_patience,
         plateau_factor=cfg.plateau_factor,
         train_dataset=train_dataset,
         num_classes=args.num_classes,
-        resume_checkpoint=args.resume
+        resume_checkpoint=args.resume,
+        use_ema=not args.no_ema,
+        ema_decay=cfg.ema_decay,
+        validate_every=args.validate_every
     )
     
     # Log experiment results to CSV
@@ -674,16 +787,20 @@ def main():
             'd_model': args.d_model,
             'num_layers': args.num_layers,
             'nhead': args.nhead,
-            'lr': args.lr,
+            'lr': lr,
+            'base_lr': args.base_lr,
+            'lr_scaled': not args.no_lr_scaling,
             'batch_size': args.batch_size,
             'dropout': args.dropout,
             'pooling': args.pooling,
             'parameters': sum(p.numel() for p in model.parameters()),
             'dim_feedforward': args.dim_feedforward,
             'num_workers': args.num_workers,
-            'warmup_epochs': args.warmup_epochs,
-            'plateau_patience': args.plateau_patience,
-            'plateau_factor': args.plateau_factor,
+            'warmup_steps': cfg.warmup_steps,
+            'plateau_patience': cfg.plateau_patience,
+            'plateau_factor': cfg.plateau_factor,
+            'weight_decay': weight_decay,
+            'use_ema': not args.no_ema,
         },
         csv_path="experiments.csv"
     )
