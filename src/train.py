@@ -208,7 +208,8 @@ def train(
     plateau_factor: float = 0.5,
     train_dataset: 'StreamlineDataset' = None,
     num_classes: int = 32,
-    label_smoothing: float = 0.1
+    label_smoothing: float = 0.1,
+    resume_checkpoint: str = None
 ) -> Dict[str, List[float]]:
     """
     Full training loop with validation, early stopping, warmup, and mixed precision.
@@ -262,11 +263,41 @@ def train(
     
     history = {
         'train_loss': [], 'train_acc': [],
-        'val_loss': [], 'val_acc': [], 'val_f1': []
+        'val_loss': [], 'val_acc': [], 'val_f1': [],
+        'epoch_time': []  # Track time per epoch
     }
     
     best_val_f1 = 0.0
     patience_counter = 0
+    start_epoch = 1
+    
+    # Resume from checkpoint if provided
+    if resume_checkpoint is not None:
+        print(f"\nResuming from checkpoint: {resume_checkpoint}")
+        checkpoint = torch.load(resume_checkpoint, map_location=device)
+        
+        # Load model and optimizer states
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        # Load scheduler states if available
+        if 'warmup_cosine_scheduler_state' in checkpoint:
+            warmup_cosine_scheduler.load_state_dict(checkpoint['warmup_cosine_scheduler_state'])
+        if 'plateau_scheduler_state' in checkpoint:
+            plateau_scheduler.load_state_dict(checkpoint['plateau_scheduler_state'])
+        
+        # Load scaler state if using AMP
+        if scaler is not None and checkpoint.get('scaler_state') is not None:
+            scaler.load_state_dict(checkpoint['scaler_state'])
+        
+        # Restore training state
+        start_epoch = checkpoint['epoch'] + 1
+        history = checkpoint.get('history', history)
+        best_val_f1 = checkpoint.get('best_val_f1', max(history['val_f1']) if history['val_f1'] else 0.0)
+        patience_counter = checkpoint.get('patience_counter', 0)
+        
+        print(f"  Resumed at epoch {start_epoch}, best F1: {best_val_f1:.2f}%")
+        print(f"  Current LR: {optimizer.param_groups[0]['lr']:.2e}")
     
     # TensorBoard setup
     run_name = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -285,7 +316,7 @@ def train(
     }
     writer.add_text('Hyperparameters', str(hparams), 0)
     
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         # Update sampler for new epoch (different random subset)
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -293,6 +324,8 @@ def train(
         print(f"\n{'='*60}")
         print(f"Epoch {epoch}/{epochs} | LR: {optimizer.param_groups[0]['lr']:.2e}")
         print('='*60)
+        
+        epoch_start_time = time.time()
         
         # Train
         train_metrics = train_epoch(
@@ -304,7 +337,9 @@ def train(
         
         # Validate
         val_metrics = validate(model, val_loader, criterion, device, use_amp=use_amp)
-        print(f"  Val Loss: {val_metrics['loss']:.4f} | Val Acc: {val_metrics['accuracy']:.2f}% | Val F1: {val_metrics['macro_f1']:.2f}%")
+        
+        epoch_time = time.time() - epoch_start_time
+        print(f"  Val Loss: {val_metrics['loss']:.4f} | Val Acc: {val_metrics['accuracy']:.2f}% | Val F1: {val_metrics['macro_f1']:.2f}% | Time: {epoch_time:.1f}s")
         
         # Update schedulers
         warmup_cosine_scheduler.step()
@@ -316,6 +351,7 @@ def train(
         history['val_loss'].append(val_metrics['loss'])
         history['val_acc'].append(val_metrics['accuracy'])
         history['val_f1'].append(val_metrics['macro_f1'])
+        history['epoch_time'].append(epoch_time)
         
         # TensorBoard logging
         writer.add_scalars('Loss', {
@@ -351,11 +387,16 @@ def train(
                 print(f"\n  Early stopping triggered after {epoch} epochs")
                 break
         
-        # Save latest checkpoint
+        # Save latest checkpoint with all states needed for resume
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
+            'warmup_cosine_scheduler_state': warmup_cosine_scheduler.state_dict(),
+            'plateau_scheduler_state': plateau_scheduler.state_dict(),
+            'scaler_state': scaler.state_dict() if scaler is not None else None,
+            'best_val_f1': best_val_f1,
+            'patience_counter': patience_counter,
             'history': history
         }, os.path.join(save_dir, 'latest_checkpoint.pt'))
         
@@ -402,6 +443,7 @@ def log_experiment(
     best_epoch = history['val_f1'].index(best_val_f1) + 1 if history['val_f1'] else 0
     final_train_loss = history['train_loss'][-1] if history['train_loss'] else 0
     final_val_loss = history['val_loss'][-1] if history['val_loss'] else 0
+    mean_epoch_time = sum(history.get('epoch_time', [0])) / max(1, len(history.get('epoch_time', [1])))
     
     # Create row
     row = {
@@ -412,6 +454,7 @@ def log_experiment(
         'best_val_acc': f"{best_val_acc:.2f}",
         'best_epoch': best_epoch,
         'total_epochs': len(history['train_loss']),
+        'mean_epoch_time': f"{mean_epoch_time:.1f}",
         'final_train_loss': f"{final_train_loss:.4f}",
         'final_val_loss': f"{final_val_loss:.4f}",
         'd_model': params.get('d_model', ''),
@@ -502,6 +545,8 @@ def main():
                         help='DataLoader workers')
     parser.add_argument('--save_dir', type=str, default=cfg.save_dir,
                         help='Save directory')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume training from')
     
     args = parser.parse_args()
     
@@ -616,7 +661,8 @@ def main():
         plateau_patience=cfg.plateau_patience,
         plateau_factor=cfg.plateau_factor,
         train_dataset=train_dataset,
-        num_classes=args.num_classes
+        num_classes=args.num_classes,
+        resume_checkpoint=args.resume
     )
     
     # Log experiment results to CSV
