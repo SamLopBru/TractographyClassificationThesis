@@ -1,0 +1,4 @@
+timestamp,experiment,encoder_type,best_val_f1,best_val_acc,best_epoch,total_epochs,mean_epoch_time,final_train_loss,final_val_loss,d_model,dim_feedforward,num_layers,nhead,lr,batch_size,dropout,pooling,num_workers,warmup_epochs,plateau_patience,plateau_factor,sampling_pct,epoch_sampling_pct,val_sampling_pct,parameters
+2026-02-07 00:42:33,transformer_d256_L6,transformer,90.81,88.18,8,13,466.6,0.8401,0.8891,256,512,6,8,0.000282842712474619,1024,0.1,mean,8,,3,0.5,0.1,0.1,0.1,3238688
+2026-02-06 12:27:29,transformer_d256_L6,transformer,90.79,88.17,14,19,254.1,0.8499,0.8778,256,512,6,8,0.000282842712474619,1024,0.1,mean,8,,3,0.5,0.1,0.05,0.1,3238688
+2026-02-06 17:32:11,lstm_d256_L6,lstm,91.12,88.25,20,20,335.5,0.8287,0.8844,256,512,6,8,0.000282842712474619,1024,0.1,mean,8,,3,0.5,0.1,0.05,0.1,8564000

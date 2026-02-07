@@ -20,6 +20,7 @@ class TrainConfig:
     val_dir: str = "sequences/validset"
     sampling_pct: float = 0.10          # Percentage of streamlines to index per tract
     epoch_sampling_pct: float = 0.05    # Percentage of indexed streamlines per epoch
+    val_sampling_pct: float = 0.10      # Percentage of validation streamlines to use (higher = more stable metrics)
     min_samples_per_class: int = 10     # Minimum samples per class per epoch
     full_sample_threshold: int = 1000   # If tract has fewer than this, take 100%
     max_streamlines_per_tract: Optional[int] = None
@@ -37,12 +38,12 @@ class TrainConfig:
     
     # Training configuration
     epochs: int = 20            # More epochs for convergence
-    batch_size: int = 2048      # Safe for 16GB with d_model=256
+    batch_size: int = 1024      # Safe for 16GB with d_model=256
     base_lr: float = 1e-4       # Base LR (will be scaled by batch size)
     lr_scale_with_batch: bool = True  # Scale LR with sqrt(batch_size/256)
     weight_decay_transformer: float = 1e-4  # Weight decay for Transformer
     weight_decay_lstm: float = 1e-5         # Weight decay for LSTM (lower)
-    accumulation_steps: int = 1
+    accumulation_steps: int = 2
     patience: int = 5           # Early Stop patience
     use_amp: bool = True        # Essential for memory
     warmup_steps: int = 500     # Warmup by steps (more consistent than epochs)

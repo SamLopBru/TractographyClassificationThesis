@@ -156,8 +156,8 @@ class StratifiedEpochSampler(Sampler[int]):
         
         print(f"StratifiedEpochSampler: {self.n_samples} samples per epoch "
               f"({self.sampling_percentage*100:.1f}% per class, full if <{self.full_sample_threshold})")
-        for tract_id in sorted(self.samples_per_class.keys()):
-            print(f"  Class {tract_id}: {self.samples_per_class[tract_id]} / {len(self.class_indices[tract_id])}")
+        # for tract_id in sorted(self.samples_per_class.keys()):
+        #     print(f"  Class {tract_id}: {self.samples_per_class[tract_id]} / {len(self.class_indices[tract_id])}")
     
     def set_epoch(self, epoch: int) -> None:
         """

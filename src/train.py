@@ -56,8 +56,9 @@ def train_epoch(
 ) -> Dict[str, float]:
     """Train for one epoch with optional mixed precision, gradient accumulation, and EMA."""
     model.train()
-    total_loss = 0.0
-    total_correct = 0
+    # Initialize metrics as tensors to avoid CPU-GPU sync
+    total_loss = torch.tensor(0.0, device=device)
+    total_correct = torch.tensor(0.0, device=device)
     total_samples = 0
     total_grad_norm = 0.0
     grad_norm_count = 0
@@ -131,15 +132,17 @@ def train_epoch(
                         for ema_param, model_param in zip(ema_model.parameters(), model.parameters()):
                             ema_param.data.mul_(ema_decay).add_(model_param.data, alpha=1 - ema_decay)
         
-        # Metrics (multiply back for logging)
-        total_loss += loss.item() * accumulation_steps * labels.size(0)
-        predictions = logits.argmax(dim=1)
-        total_correct += (predictions == labels).sum().item()
-        total_samples += labels.size(0)
+        # Metrics (accumulate tensors to avoid sync)
+        with torch.no_grad():
+            total_loss += loss.detach() * accumulation_steps * labels.size(0)
+            predictions = logits.argmax(dim=1)
+            total_correct += (predictions == labels).sum()
+            total_samples += labels.size(0)
         
         if (batch_idx + 1) % log_interval == 0:
-            avg_loss = total_loss / total_samples
-            accuracy = 100.0 * total_correct / total_samples
+            # Sync only for logging
+            avg_loss = total_loss.item() / total_samples
+            accuracy = 100.0 * total_correct.item() / total_samples
             elapsed = time.time() - start_time
             print(f"  Batch {batch_idx + 1}/{len(dataloader)} | "
                   f"Loss: {avg_loss:.4f} | Acc: {accuracy:.2f}% | "
@@ -158,8 +161,8 @@ def train_epoch(
         optimizer.zero_grad()
     
     return {
-        'loss': total_loss / total_samples,
-        'accuracy': 100.0 * total_correct / total_samples,
+        'loss': total_loss.item() / total_samples,
+        'accuracy': 100.0 * total_correct.item() / total_samples,
         'grad_norm': total_grad_norm / max(1, grad_norm_count)
     }
 
@@ -546,6 +549,9 @@ def log_experiment(
         'warmup_epochs': params.get('warmup_epochs', ''),
         'plateau_patience': params.get('plateau_patience', ''),
         'plateau_factor': params.get('plateau_factor', ''),
+        'sampling_pct': params.get('sampling_pct', ''),
+        'epoch_sampling_pct': params.get('epoch_sampling_pct', ''),
+        'val_sampling_pct': params.get('val_sampling_pct', ''),
         'parameters': params.get('parameters', ''),
     }
     
@@ -576,6 +582,8 @@ def main():
                         help='Percentage of streamlines to index per tract')
     parser.add_argument('--epoch_sampling_pct', type=float, default=cfg.epoch_sampling_pct,
                         help='Percentage of indexed streamlines to use per epoch')
+    parser.add_argument('--val_sampling_pct', type=float, default=cfg.val_sampling_pct,
+                        help='Percentage of validation streamlines to use (higher = more stable metrics)')
     parser.add_argument('--min_samples_per_class', type=int, default=cfg.min_samples_per_class,
                         help='Minimum samples per class per epoch')
     parser.add_argument('--full_sample_threshold', type=int, default=cfg.full_sample_threshold,
@@ -671,10 +679,10 @@ def main():
         shuffle=True
     )
     
-    # Create stratified validation sampler (20% per class for reliable Macro F1)
+    # Create stratified validation sampler (larger % for reliable metrics)
     val_sampler = StratifiedEpochSampler(
         val_dataset,
-        sampling_percentage=0.10,  
+        sampling_percentage=args.val_sampling_pct,  
         min_samples_per_class=10,
         full_sample_threshold=args.full_sample_threshold,
         seed=42,
@@ -741,8 +749,9 @@ def main():
         print(f"Using base LR: {lr:.2e}")
     else:
         # Linear scaling rule: LR scales with sqrt(batch_size / 256)
-        lr = args.base_lr * math.sqrt(args.batch_size / 256)
-        print(f"LR scaled with batch size: {args.base_lr:.2e} * sqrt({args.batch_size}/256) = {lr:.2e}")
+        effective_batch_size = args.batch_size * args.accumulation_steps
+        lr = args.base_lr * math.sqrt(effective_batch_size / 256)
+        print(f"LR scaled with batch size: {args.base_lr:.2e} * sqrt({effective_batch_size}/256) = {lr:.2e}")
     
     # Architecture-specific weight decay
     if args.encoder_type == 'transformer':
@@ -795,12 +804,17 @@ def main():
             'pooling': args.pooling,
             'parameters': sum(p.numel() for p in model.parameters()),
             'dim_feedforward': args.dim_feedforward,
+            'sampling_pct': args.sampling_pct,
+            'epoch_sampling_pct': args.epoch_sampling_pct,
+            'val_sampling_pct': args.val_sampling_pct,
             'num_workers': args.num_workers,
             'warmup_steps': cfg.warmup_steps,
             'plateau_patience': cfg.plateau_patience,
             'plateau_factor': cfg.plateau_factor,
             'weight_decay': weight_decay,
             'use_ema': not args.no_ema,
+            'sampling_pct': args.sampling_pct,
+            'epoch_sampling_pct': args.epoch_sampling_pct,
         },
         csv_path="experiments.csv"
     )
