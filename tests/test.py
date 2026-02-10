@@ -40,7 +40,7 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import label_binarize
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "./")))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.encoder import StreamlineEncoder, LightweightStreamlineEncoder
 from src.dataloader import StreamlineDataset, streamline_collate_fn
@@ -66,7 +66,7 @@ def load_model(
             dim_feedforward=config.dim_feedforward,
             num_classes=config.num_classes,
             dropout=config.dropout,
-            pooling=config.pooling
+            pooling="cls"
         )
     else:
         model = LightweightStreamlineEncoder(
@@ -77,7 +77,10 @@ def load_model(
             dropout=config.dropout
         )
     
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Handle state_dict keys from torch.compile (prefixed with '_orig_mod.')
+    state_dict = checkpoint['model_state_dict']
+    state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
     
@@ -514,7 +517,7 @@ def main():
     # Create dataloader
     test_loader = DataLoader(
         test_dataset,
-        batch_size=args.batch_size,
+        batch_size=4096,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
