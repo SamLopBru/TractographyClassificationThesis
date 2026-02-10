@@ -607,7 +607,7 @@ def main():
     parser.add_argument('--dropout', type=float, default=cfg.dropout,
                         help='Dropout rate')
     parser.add_argument('--pooling', type=str, default=cfg.pooling,
-                        choices=['cls', 'mean', 'max'], help='Pooling strategy')
+                        choices=['cls', 'mean', 'max', 'last'], help='Pooling strategy (last only for LSTM)')
     
     # Training arguments
     parser.add_argument('--epochs', type=int, default=cfg.epochs,
@@ -732,7 +732,8 @@ def main():
             hidden_size=args.d_model,
             num_layers=args.num_layers,
             num_classes=args.num_classes,
-            dropout=args.dropout
+            dropout=args.dropout,
+            pooling=args.pooling if args.pooling in ['last', 'cls', 'mean', 'max'] else 'last'
         )
     
     print(f"\nModel: {args.encoder_type}")

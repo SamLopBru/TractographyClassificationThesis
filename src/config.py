@@ -49,6 +49,7 @@ class TrainConfig:
     warmup_steps: int = 500     # Warmup by steps (more consistent than epochs)
     plateau_patience: int = 3   # Epochs before LR reduction on plateau
     plateau_factor: float = 0.5 # LR reduction factor on plateau
+    max_grad_norm: float = 1.0  # Maximum gradient norm for clipping
     use_ema: bool = True        # Use Exponential Moving Average
     ema_decay: float = 0.999    # EMA decay factor
     validate_every: int = 2     # Validate every N epochs (2 during warmup)
