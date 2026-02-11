@@ -779,7 +779,7 @@ def main():
         accumulation_steps=args.accumulation_steps,
         train_sampler=train_sampler,
         val_sampler=val_sampler,
-        warmup_steps=cfg.warmup_steps,
+        warmup_steps=args.warmup_steps,
         plateau_patience=cfg.plateau_patience,
         plateau_factor=cfg.plateau_factor,
         train_dataset=train_dataset,
