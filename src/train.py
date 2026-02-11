@@ -277,6 +277,7 @@ def train(
             return 0.1 + 0.9 * (current_step / warmup_steps)
         else:
             # Cosine annealing after warmup: decay from 100% to 1%
+            # Formula in: https://docs.pytorch.org/docs/stable/generated/torch.optim.lr_scheduler.CosineAnnealingLR.html
             progress = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
             return 0.01 + 0.99 * 0.5 * (1.0 + math.cos(math.pi * progress))
     
@@ -546,7 +547,7 @@ def log_experiment(
         'dropout': params.get('dropout', ''),
         'pooling': params.get('pooling', ''),
         'num_workers': params.get('num_workers', ''),
-        'warmup_epochs': params.get('warmup_epochs', ''),
+        'warmup_steps': params.get('warmup_steps', ''),
         'plateau_patience': params.get('plateau_patience', ''),
         'plateau_factor': params.get('plateau_factor', ''),
         'sampling_pct': params.get('sampling_pct', ''),
@@ -638,6 +639,8 @@ def main():
                         help='Save directory')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume training from')
+    parser.add_argument('--pretrained_encoder', type=str, default=None,
+                        help='Path to contrastive pre-trained encoder checkpoint')
     
     args = parser.parse_args()
     
@@ -741,6 +744,26 @@ def main():
     print(f"\nModel: {args.encoder_type}")
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
+    # Load pre-trained encoder weights (from contrastive pre-training)
+    if args.pretrained_encoder:
+        print(f"\nLoading pre-trained encoder from: {args.pretrained_encoder}")
+        checkpoint = torch.load(args.pretrained_encoder, map_location=device, weights_only=False)
+        if 'encoder_state_dict' in checkpoint:
+            state_dict = checkpoint['encoder_state_dict']
+        elif 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        else:
+            raise ValueError(f"Unknown checkpoint format. Keys: {list(checkpoint.keys())}")
+        
+        # Handle torch.compile prefix
+        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+        
+        # Load encoder weights (strict=False to skip classifier head)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        print(f"  Loaded encoder weights (missing: {len(missing)}, unexpected: {len(unexpected)})")
+        if missing:
+            print(f"  Missing keys (expected — classifier head): {missing}")
+    
     # Compile model for faster execution (PyTorch 2.0+)
     # Use dynamic=True for variable-length streamline inputs
     model = torch.compile(model, dynamic=True)
@@ -811,11 +834,12 @@ def main():
             'epoch_sampling_pct': args.epoch_sampling_pct,
             'val_sampling_pct': args.val_sampling_pct,
             'num_workers': args.num_workers,
-            'warmup_steps': cfg.warmup_steps,
+            'warmup_steps': args.warmup_steps,
             'plateau_patience': cfg.plateau_patience,
             'plateau_factor': cfg.plateau_factor,
             'weight_decay': weight_decay,
             'use_ema': not args.no_ema,
+            'pretrained': args.pretrained_encoder is not None,
             'sampling_pct': args.sampling_pct,
             'epoch_sampling_pct': args.epoch_sampling_pct,
         },

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 
 
@@ -107,6 +108,69 @@ class StreamlineEncoder(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
     
+    def get_embeddings(
+        self, 
+        x: torch.Tensor, 
+        lengths: torch.Tensor = None,
+        padding_mask: torch.Tensor = None
+    ) -> torch.Tensor:
+        """
+        Extract pooled embeddings before the classifier head.
+        
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, 5)
+            lengths: Optional tensor of actual sequence lengths (batch_size,)
+            padding_mask: Optional boolean mask where True indicates padding positions (batch_size, seq_len)
+        
+        Returns:
+            Pooled embeddings of shape (batch_size, d_model)
+        """
+        batch_size, seq_len, _ = x.shape
+        
+        # Create padding mask from lengths if not provided
+        if padding_mask is None and lengths is not None:
+            indices = torch.arange(seq_len, device=x.device).unsqueeze(0)
+            padding_mask = indices >= lengths.unsqueeze(1)
+        
+        # Project input to model dimension
+        x = self.input_projection(x)  # (batch, seq, d_model)
+        
+        # Add CLS token if using cls pooling
+        if self.pooling == 'cls':
+            cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+            x = torch.cat([cls_tokens, x], dim=1)
+            
+            if padding_mask is not None:
+                cls_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=x.device)
+                padding_mask = torch.cat([cls_mask, padding_mask], dim=1)
+        
+        # Positional encoding
+        x = x.transpose(0, 1)
+        x = self.pos_encoder(x)
+        x = x.transpose(0, 1)
+        
+        # Transformer encoder
+        x = self.transformer_encoder(x, src_key_padding_mask=padding_mask)
+        
+        # Pool the sequence
+        if self.pooling == 'cls':
+            pooled = x[:, 0]
+        elif self.pooling == 'mean':
+            if padding_mask is not None:
+                mask = ~padding_mask.unsqueeze(-1)
+                x = x * mask
+                pooled = x.sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+            else:
+                pooled = x.mean(dim=1)
+        elif self.pooling == 'max':
+            if padding_mask is not None:
+                x = x.masked_fill(padding_mask.unsqueeze(-1), float('-inf'))
+            pooled = x.max(dim=1)[0].clamp(min=-1e9)
+        else:
+            raise ValueError(f"Unknown pooling strategy: {self.pooling}")
+        
+        return pooled
+    
     def forward(
         self, 
         x: torch.Tensor, 
@@ -122,58 +186,8 @@ class StreamlineEncoder(nn.Module):
         Returns:
             Class logits of shape (batch_size, num_classes)
         """
-        batch_size, seq_len, _ = x.shape
-        
-        # Create padding mask from lengths if not provided
-        if padding_mask is None and lengths is not None:
-            # Create mask: True where positions are padding (to be ignored)
-            indices = torch.arange(seq_len, device=x.device).unsqueeze(0)
-            padding_mask = indices >= lengths.unsqueeze(1)
-        
-        # Project input to model dimension
-        x = self.input_projection(x)  # (batch, seq, d_model)
-        
-        # Add CLS token if using cls pooling
-        if self.pooling == 'cls':
-            cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-            x = torch.cat([cls_tokens, x], dim=1)  # (batch, 1 + seq, d_model)
-            
-            # Extend padding mask for CLS token (CLS is never masked)
-            if padding_mask is not None:
-                cls_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=x.device)
-                padding_mask = torch.cat([cls_mask, padding_mask], dim=1)
-        
-        # Transpose for positional encoding: (batch, seq, d_model) -> (seq, batch, d_model)
-        x = x.transpose(0, 1)
-        x = self.pos_encoder(x)
-        x = x.transpose(0, 1)  # Back to (batch, seq, d_model)
-        
-        # Apply transformer encoder
-        x = self.transformer_encoder(x, src_key_padding_mask=padding_mask)
-        
-        # Pool the sequence
-        if self.pooling == 'cls':
-            # Use CLS token representation
-            pooled = x[:, 0]  # (batch, d_model)
-        elif self.pooling == 'mean':
-            # Mean pooling (excluding padding)
-            if padding_mask is not None:
-                mask = ~padding_mask.unsqueeze(-1)  # (batch, seq, 1)
-                x = x * mask
-                pooled = x.sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-            else:
-                pooled = x.mean(dim=1)
-        elif self.pooling == 'max':
-            # Max pooling (excluding padding)
-            if padding_mask is not None:
-                x = x.masked_fill(padding_mask.unsqueeze(-1), float('-inf'))
-            pooled = x.max(dim=1)[0].clamp(min=-1e9)
-        else:
-            raise ValueError(f"Unknown pooling strategy: {self.pooling}")
-        
-        # Classify
+        pooled = self.get_embeddings(x, lengths, padding_mask)
         logits = self.classifier(pooled)
-        
         return logits
 
 
@@ -237,6 +251,79 @@ class LightweightStreamlineEncoder(nn.Module):
             nn.Linear(hidden_size, num_classes)
         )
     
+    def get_embeddings(
+        self, 
+        x: torch.Tensor, 
+        lengths: torch.Tensor = None,
+        padding_mask: torch.Tensor = None
+    ) -> torch.Tensor:
+        """
+        Extract pooled embeddings before the classifier head.
+        
+        Args:
+            x: Input tensor of shape (batch_size, seq_len, input_size)
+            lengths: Optional tensor of actual sequence lengths (batch_size,)
+            padding_mask: Optional boolean mask where True indicates padding (batch_size, seq_len)
+        
+        Returns:
+            Pooled embeddings of shape (batch_size, output_size)
+        """
+        batch_size, seq_len, _ = x.shape
+        
+        if padding_mask is None and lengths is not None:
+            indices = torch.arange(seq_len, device=x.device).unsqueeze(0)
+            padding_mask = indices >= lengths.unsqueeze(1)
+        
+        if self.pooling == 'cls':
+            cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+            x = torch.cat([cls_tokens, x], dim=1)
+            if lengths is not None:
+                lengths = lengths + 1
+            if padding_mask is not None:
+                cls_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=x.device)
+                padding_mask = torch.cat([cls_mask, padding_mask], dim=1)
+        
+        if self.pooling == 'last':
+            if lengths is not None:
+                packed = nn.utils.rnn.pack_padded_sequence(
+                    x, lengths.cpu(), batch_first=True, enforce_sorted=False
+                )
+                _, (hidden, _) = self.lstm(packed)
+            else:
+                _, (hidden, _) = self.lstm(x)
+            
+            if self.num_directions == 2:
+                pooled = torch.cat([hidden[-2], hidden[-1]], dim=1)
+            else:
+                pooled = hidden[-1]
+        else:
+            if lengths is not None:
+                packed = nn.utils.rnn.pack_padded_sequence(
+                    x, lengths.cpu(), batch_first=True, enforce_sorted=False
+                )
+                output, _ = self.lstm(packed)
+                output, _ = nn.utils.rnn.pad_packed_sequence(output, batch_first=True)
+            else:
+                output, _ = self.lstm(x)
+            
+            if self.pooling == 'cls':
+                pooled = output[:, 0]
+            elif self.pooling == 'mean':
+                if padding_mask is not None:
+                    mask = ~padding_mask.unsqueeze(-1)
+                    output = output * mask
+                    pooled = output.sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+                else:
+                    pooled = output.mean(dim=1)
+            elif self.pooling == 'max':
+                if padding_mask is not None:
+                    output = output.masked_fill(padding_mask.unsqueeze(-1), float('-inf'))
+                pooled = output.max(dim=1)[0].clamp(min=-1e9)
+            else:
+                raise ValueError(f"Unknown pooling strategy: {self.pooling}")
+        
+        return pooled
+    
     def forward(
         self, 
         x: torch.Tensor, 
@@ -252,74 +339,42 @@ class LightweightStreamlineEncoder(nn.Module):
         Returns:
             Class logits of shape (batch_size, num_classes)
         """
-        batch_size, seq_len, _ = x.shape
-        
-        # Create padding mask from lengths if not provided
-        if padding_mask is None and lengths is not None:
-            indices = torch.arange(seq_len, device=x.device).unsqueeze(0)
-            padding_mask = indices >= lengths.unsqueeze(1)
-        
-        # Prepend CLS token if using cls pooling
-        if self.pooling == 'cls':
-            cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-            x = torch.cat([cls_tokens, x], dim=1)  # (batch, 1 + seq, input_size)
-            
-            # Update lengths and mask for CLS token
-            if lengths is not None:
-                lengths = lengths + 1
-            if padding_mask is not None:
-                cls_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=x.device)
-                padding_mask = torch.cat([cls_mask, padding_mask], dim=1)
-        
-        # Process through LSTM
-        if self.pooling == 'last':
-            # Original behavior: use final hidden state
-            if lengths is not None:
-                packed = nn.utils.rnn.pack_padded_sequence(
-                    x, lengths.cpu(), batch_first=True, enforce_sorted=False
-                )
-                _, (hidden, _) = self.lstm(packed)
-            else:
-                _, (hidden, _) = self.lstm(x)
-            
-            # hidden: (num_layers * num_directions, batch, hidden_size)
-            if self.num_directions == 2:
-                pooled = torch.cat([hidden[-2], hidden[-1]], dim=1)
-            else:
-                pooled = hidden[-1]
-        else:
-            # Need all outputs for cls/mean/max pooling
-            if lengths is not None:
-                packed = nn.utils.rnn.pack_padded_sequence(
-                    x, lengths.cpu(), batch_first=True, enforce_sorted=False
-                )
-                output, _ = self.lstm(packed)
-                output, _ = nn.utils.rnn.pad_packed_sequence(output, batch_first=True)
-            else:
-                output, _ = self.lstm(x)
-            
-            # output: (batch, seq_len, hidden_size * num_directions)
-            if self.pooling == 'cls':
-                # Use the output corresponding to the CLS token (first position)
-                pooled = output[:, 0]  # (batch, output_size)
-            elif self.pooling == 'mean':
-                # Mean pooling (excluding padding)
-                if padding_mask is not None:
-                    mask = ~padding_mask.unsqueeze(-1)  # (batch, seq, 1)
-                    output = output * mask
-                    pooled = output.sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-                else:
-                    pooled = output.mean(dim=1)
-            elif self.pooling == 'max':
-                # Max pooling (excluding padding)
-                if padding_mask is not None:
-                    output = output.masked_fill(padding_mask.unsqueeze(-1), float('-inf'))
-                pooled = output.max(dim=1)[0].clamp(min=-1e9)
-            else:
-                raise ValueError(f"Unknown pooling strategy: {self.pooling}")
-        
+        pooled = self.get_embeddings(x, lengths, padding_mask)
         logits = self.classifier(pooled)
         return logits
+
+
+
+class ProjectionHead(nn.Module):
+    """
+    MLP projection head for contrastive learning.
+    
+    Projects encoder embeddings into a lower-dimensional, L2-normalized space
+    where contrastive loss is computed. Only used during contrastive pre-training.
+    
+    Architecture: Linear → BatchNorm → ReLU → Linear → L2-normalize
+    Reference: "Supervised Contrastive Learning" (Khosla et al., 2020)
+    """
+    
+    def __init__(self, input_dim: int, hidden_dim: int = 256, output_dim: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, output_dim)
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Embeddings of shape (batch_size, input_dim)
+        
+        Returns:
+            L2-normalized projections of shape (batch_size, output_dim)
+        """
+        projected = self.net(x)
+        return F.normalize(projected, dim=1)
 
 
 # Convenience factory function
