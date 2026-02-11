@@ -67,7 +67,6 @@ class StreamlineEncoder(nn.Module):
         
         # Input projection: (batch, seq, 5) -> (batch, seq, d_model)
         self.input_projection = nn.Linear(input_size, d_model)
-        self.input_norm = nn.LayerNorm(d_model)
         
         # CLS token for classification (learnable)
         if pooling == 'cls':
@@ -76,46 +75,37 @@ class StreamlineEncoder(nn.Module):
         # Positional encoding
         self.pos_encoder = PositionalEncoding(d_model, max_len, dropout)
         
-        # Transformer encoder with stochastic depth
-        # Linearly increasing drop path rate from 0 to drop_path_rate
-        drop_path_rate = 0.1
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, num_layers)]
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True  # Pre-norm for better training stability
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer, 
+            num_layers=num_layers,
+            enable_nested_tensor=True
+        )
         
-        self.transformer_layers = nn.ModuleList([
-            TransformerEncoderLayerWithDropPath(
-                d_model=d_model,
-                nhead=nhead,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout,
-                drop_path=dpr[i],
-                norm_first=True  # Pre-norm for better training stability
-            )
-            for i in range(num_layers)
-        ])
-        self.final_norm = nn.LayerNorm(d_model)  # Final norm for pre-norm architecture
-        
-        # Classification head with bottleneck
-        bottleneck_dim = d_model // 2
+        # Classification head
         self.classifier = nn.Sequential(
             nn.LayerNorm(d_model),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, bottleneck_dim),
+            nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(bottleneck_dim, num_classes)
+            nn.Linear(d_model, num_classes)
         )
         
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize weights with targeted initialization."""
-        for name, p in self.named_parameters():
-            if 'cls_token' in name:
-                nn.init.normal_(p, std=0.02)  # Small random init for CLS token
-            elif p.dim() > 1:
+        """Initialize weights with Xavier/Glorot initialization."""
+        for p in self.parameters():
+            if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
-            elif p.dim() == 1:
-                nn.init.zeros_(p)  # Biases to zero
     
     def forward(
         self, 
@@ -140,8 +130,8 @@ class StreamlineEncoder(nn.Module):
             indices = torch.arange(seq_len, device=x.device).unsqueeze(0)
             padding_mask = indices >= lengths.unsqueeze(1)
         
-        # Project input to model dimension with normalization
-        x = self.input_norm(self.input_projection(x))  # (batch, seq, d_model)
+        # Project input to model dimension
+        x = self.input_projection(x)  # (batch, seq, d_model)
         
         # Add CLS token if using cls pooling
         if self.pooling == 'cls':
@@ -158,10 +148,8 @@ class StreamlineEncoder(nn.Module):
         x = self.pos_encoder(x)
         x = x.transpose(0, 1)  # Back to (batch, seq, d_model)
         
-        # Apply transformer encoder layers with stochastic depth
-        for layer in self.transformer_layers:
-            x = layer(x, src_key_padding_mask=padding_mask)
-        x = self.final_norm(x)
+        # Apply transformer encoder
+        x = self.transformer_encoder(x, src_key_padding_mask=padding_mask)
         
         # Pool the sequence
         if self.pooling == 'cls':
@@ -241,14 +229,12 @@ class LightweightStreamlineEncoder(nn.Module):
             bidirectional=bidirectional
         )
         
-        bottleneck_dim = hidden_size  # output_size -> hidden_size -> num_classes
         self.classifier = nn.Sequential(
             nn.LayerNorm(self.output_size),
-            nn.Dropout(dropout),
-            nn.Linear(self.output_size, bottleneck_dim),
+            nn.Linear(self.output_size, hidden_size),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(bottleneck_dim, num_classes)
+            nn.Linear(hidden_size, num_classes)
         )
     
     def forward(
@@ -341,7 +327,7 @@ def create_encoder(
     encoder_type: str = 'transformer',
     num_classes: int = 32,
     **kwargs
-) -> nn.Module:
+    ) -> nn.Module:
     """
     Factory function to create streamline encoders.
     
@@ -360,31 +346,3 @@ def create_encoder(
     else:
         raise ValueError(f"Unknown encoder type: {encoder_type}")
 
-
-# if __name__ == "__main__":
-#     from src.config import TrainConfig, DEFAULT_CONFIG
-
-#     cfg = DEFAULT_CONFIG
-
-#     # Test the encoders
-#     batch_size = cfg.batch_size
-#     seq_len = 150  # Variable length streamlines
-#     input_size = cfg.input_size
-#     num_classes = cfg.num_classes
-    
-#     # Create sample data
-#     x = torch.randn(batch_size, seq_len, input_size)
-#     lengths = torch.randint(50, seq_len + 1, (batch_size,))
-    
-#     transformer_encoder = StreamlineEncoder(
-#         input_size=input_size,
-#         d_model=cfg.d_model,
-#         nhead=cfg.nhead,
-#         num_layers=cfg.num_layers,
-#         num_classes=num_classes
-#     )
-    
-#     output = transformer_encoder(x, lengths=lengths)
-#     print(f"  Input shape: {x.shape}")
-#     print(f"  Output shape: {output.shape}")
-#     print(f"  Parameters: {sum(p.numel() for p in transformer_encoder.parameters()):,}")

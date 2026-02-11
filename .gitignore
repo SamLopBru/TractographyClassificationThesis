@@ -23,6 +23,7 @@ runs/
 
 # Images generated during experiments
 images/*.png
+tests/test_results*
 
 # Jupyter notebooks checkpoints
 .ipynb_checkpoints/

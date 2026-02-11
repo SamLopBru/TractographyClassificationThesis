@@ -554,6 +554,12 @@ def main():
     print(f"\n📋 Classification Report:\n")
     print(metrics['classification_report'])
     
+    # Save classification report to file
+    report_path = os.path.join(args.output_dir, 'classification_report.txt')
+    with open(report_path, 'w') as f:
+        f.write(metrics['classification_report'])
+    print(f"💾 Classification report saved to {report_path}")
+    
     # Generate plots
     print("\n📈 Generating visualization plots...")
     

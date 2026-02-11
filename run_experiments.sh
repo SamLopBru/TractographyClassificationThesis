@@ -10,16 +10,12 @@ echo "Starting Experiments..."
 echo "======================="
 
 # 1. CLS + more data (highest expected gain)
-echo "Running Experiment 1: CLS + more data"
-uv run src/train.py $COMMON_ARGS --pooling cls --epoch_sampling_pct 0.15 --val_sampling_pct 0.15
+echo "Running Experiment 1: CLS + more time + more warmup"
+uv run src/train.py --pooling cls --epochs 40 --patience 10 --epoch_sampling_pct 0.05 --warmup_steps 1500 --save_dir checkpoints/40
 
-# 2. CLS + longer training
-echo "Running Experiment 2: CLS + longer training"
-uv run src/train.py $COMMON_ARGS --pooling cls --epochs 40 --patience 10
+echo "Running Experiment 2: CLS + LR 5e-5 + more warmup"
+uv run src/train.py --pooling cls --epochs 30 --patience 10 --base_lr 5e-5 --warmup_steps 1000 --save_dir checkpoints/30
 
-# 3. LSTM L4
-echo "Running Experiment 3: LSTM L4 + CLS"
-uv run src/train.py $COMMON_ARGS --encoder_type lstm --num_layers 4 --pooling cls
 
 echo "======================="
 echo "All experiments completed!"

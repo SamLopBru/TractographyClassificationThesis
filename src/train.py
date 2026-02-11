@@ -49,11 +49,11 @@ def train_epoch(
     scaler: GradScaler = None,
     use_amp: bool = True,
     accumulation_steps: int = 1,
-    log_interval: int = 10,
+    log_interval: int = 100,
     scheduler: optim.lr_scheduler._LRScheduler = None,
     ema_model: nn.Module = None,
     ema_decay: float = 0.999
-) -> Dict[str, float]:
+    ) -> Dict[str, float]:
     """Train for one epoch with optional mixed precision, gradient accumulation, and EMA."""
     model.train()
     # Initialize metrics as tensors to avoid CPU-GPU sync
@@ -173,8 +173,9 @@ def validate(
     dataloader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
-    use_amp: bool = True
-) -> Dict[str, float]:
+    use_amp: bool = True,
+    steps_warmup: int = 500
+    ) -> Dict[str, float]:
     """Validate the model and compute metrics including Macro F1."""
     model.eval()
     total_loss = 0.0
@@ -388,15 +389,15 @@ def train(
         )
         print(f"\n  Train Loss: {train_metrics['loss']:.4f} | Train Acc: {train_metrics['accuracy']:.2f}%")
         
-        # Update validation sampler for each epoch
-        if val_sampler is not None:
-            val_sampler.set_epoch(epoch)
-        
         # Validation scheduling: validate less frequently during warmup
         current_validate_every = validate_every * 2 if epoch <= warmup_epoch_threshold else validate_every
         should_validate = (epoch % current_validate_every == 0) or (epoch == epochs)
         
         if should_validate:
+            # Update validation sampler only when actually validating
+            if val_sampler is not None:
+                val_sampler.set_epoch(epoch)
+            
             # Validate with regular model
             val_metrics = validate(model, val_loader, criterion, device, use_amp=use_amp)
             
@@ -404,6 +405,9 @@ def train(
             if ema_model is not None:
                 ema_val_metrics = validate(ema_model, val_loader, criterion, device, use_amp=use_amp)
                 print(f"  [EMA] Val Loss: {ema_val_metrics['loss']:.4f} | Val Acc: {ema_val_metrics['accuracy']:.2f}% | Val F1: {ema_val_metrics['macro_f1']:.2f}%")
+            
+            # Plateau scheduler uses val loss
+            plateau_scheduler.step(val_metrics['loss'])
         else:
             # Use placeholder metrics when skipping validation
             val_metrics = {'loss': history['val_loss'][-1] if history['val_loss'] else 0, 
@@ -413,10 +417,6 @@ def train(
         
         epoch_time = time.time() - epoch_start_time
         print(f"  Val Loss: {val_metrics['loss']:.4f} | Val Acc: {val_metrics['accuracy']:.2f}% | Val F1: {val_metrics['macro_f1']:.2f}% | Time: {epoch_time:.1f}s")
-        
-        # Plateau scheduler uses val loss (only on validation epochs)
-        if should_validate:
-            plateau_scheduler.step(val_metrics['loss'])
         
         # Save history
         history['train_loss'].append(train_metrics['loss'])
@@ -628,6 +628,8 @@ def main():
                         help='Disable Exponential Moving Average')
     parser.add_argument('--validate_every', type=int, default=cfg.validate_every,
                         help='Validate every N epochs')
+    parser.add_argument('--warmup_steps', type=int, default=cfg.warmup_steps,
+                        help='Number of warmup steps')
     
     # System arguments
     parser.add_argument('--num_workers', type=int, default=cfg.num_workers,
