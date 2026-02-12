@@ -464,7 +464,7 @@ def contrastive_train(
                 )
                 print(f"  [EMA] Val Loss: {ema_val['loss']:.4f}")
         else:
-            val_metrics = {'loss': history['val_loss'][-1] if history['val_loss'] else 0,
+            val_metrics = {'loss': history['val_loss'][-1] if history['val_loss'] else float('inf'),
                           'alignment': 0, 'uniformity': 0}
             print("  [Skipping validation this epoch]")
         
