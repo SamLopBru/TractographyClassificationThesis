@@ -609,6 +609,8 @@ def main():
                         help='Dropout rate')
     parser.add_argument('--pooling', type=str, default=cfg.pooling,
                         choices=['cls', 'mean', 'max', 'last'], help='Pooling strategy (last only for LSTM)')
+    parser.add_argument('--pos_encoding', type=str, default=cfg.pos_encoding,
+                        choices=['absolute', 'rope'], help='Positional encoding type (transformer only)')
     
     # Training arguments
     parser.add_argument('--epochs', type=int, default=cfg.epochs,
@@ -729,7 +731,8 @@ def main():
             dim_feedforward=args.dim_feedforward,
             num_classes=args.num_classes,
             dropout=args.dropout,
-            pooling=args.pooling
+            pooling=args.pooling,
+            pos_encoding=args.pos_encoding
         )
     else:
         model = LightweightStreamlineEncoder(
@@ -840,6 +843,7 @@ def main():
             'weight_decay': weight_decay,
             'use_ema': not args.no_ema,
             'pretrained': args.pretrained_encoder is not None,
+            'pos_encoding': args.pos_encoding,
             'sampling_pct': args.sampling_pct,
             'epoch_sampling_pct': args.epoch_sampling_pct,
         },
