@@ -36,6 +36,7 @@ import copy
 import gc
 from datetime import datetime
 import json
+import csv
 from typing import Dict, List
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -542,6 +543,67 @@ def contrastive_train(
     return history
 
 
+def log_contrastive_experiment(
+    experiment_name: str,
+    encoder_type: str,
+    history: Dict[str, List[float]],
+    params: Dict,
+    csv_path: str = "experiments_contrastive.csv"
+):
+    """
+    Log contrastive pre-training results to a CSV file for comparison.
+    """
+    best_val_loss = min(history['val_loss']) if history['val_loss'] else 0
+    best_epoch = history['val_loss'].index(best_val_loss) + 1 if history['val_loss'] else 0
+    final_train_loss = history['train_loss'][-1] if history['train_loss'] else 0
+    final_val_loss = history['val_loss'][-1] if history['val_loss'] else 0
+    final_alignment = history['alignment'][-1] if history['alignment'] else 0
+    final_uniformity = history['uniformity'][-1] if history['uniformity'] else 0
+    best_alignment = min(history['alignment']) if history['alignment'] else 0
+    best_uniformity = min(history['uniformity']) if history['uniformity'] else 0
+    mean_epoch_time = sum(history.get('epoch_time', [0])) / max(1, len(history.get('epoch_time', [1])))
+
+    row = {
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'experiment': experiment_name,
+        'encoder_type': encoder_type,
+        'best_val_loss': f"{best_val_loss:.4f}",
+        'best_epoch': best_epoch,
+        'total_epochs': len(history['train_loss']),
+        'final_train_loss': f"{final_train_loss:.4f}",
+        'final_val_loss': f"{final_val_loss:.4f}",
+        'final_alignment': f"{final_alignment:.4f}",
+        'best_alignment': f"{best_alignment:.4f}",
+        'final_uniformity': f"{final_uniformity:.4f}",
+        'best_uniformity': f"{best_uniformity:.4f}",
+        'mean_epoch_time': f"{mean_epoch_time:.1f}",
+        'd_model': params.get('d_model', ''),
+        'num_layers': params.get('num_layers', ''),
+        'nhead': params.get('nhead', ''),
+        'temperature': params.get('temperature', ''),
+        'projection_dim': params.get('projection_dim', ''),
+        'lr': params.get('lr', ''),
+        'batch_size': params.get('batch_size', ''),
+        'accumulation_steps': params.get('accumulation_steps', ''),
+        'dropout': params.get('dropout', ''),
+        'pooling': params.get('pooling', ''),
+        'warmup_steps': params.get('warmup_steps', ''),
+        'sampling_pct': params.get('sampling_pct', ''),
+        'epoch_sampling_pct': params.get('epoch_sampling_pct', ''),
+        'parameters': params.get('parameters', ''),
+    }
+
+    file_exists = os.path.exists(csv_path)
+
+    with open(csv_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=row.keys())
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+    print(f"\n📊 Experiment logged to {csv_path}")
+
+
 def main():
     cfg = DEFAULT_CONFIG
     
@@ -733,6 +795,30 @@ def main():
         ema_decay=cfg.ema_decay,
         validate_every=args.validate_every,
         log_interval=args.log_interval
+    )
+
+    # Log experiment results to CSV
+    log_contrastive_experiment(
+        experiment_name=f"{args.encoder_type}_d{args.d_model}_L{args.num_layers}_t{args.temperature}",
+        encoder_type=args.encoder_type,
+        history=history,
+        params={
+            'd_model': args.d_model,
+            'num_layers': args.num_layers,
+            'nhead': args.nhead,
+            'temperature': args.temperature,
+            'projection_dim': args.projection_dim,
+            'lr': lr,
+            'batch_size': args.batch_size,
+            'accumulation_steps': args.accumulation_steps,
+            'dropout': args.dropout,
+            'pooling': args.pooling,
+            'warmup_steps': args.warmup_steps,
+            'sampling_pct': args.sampling_pct,
+            'epoch_sampling_pct': args.epoch_sampling_pct,
+            'parameters': sum(p.numel() for p in encoder.parameters()),
+        },
+        csv_path="experiments_contrastive.csv"
     )
 
 
