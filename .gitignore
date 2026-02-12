@@ -22,7 +22,7 @@ checkpoints/
 runs/
 
 # Images generated during experiments
-images/*.png
+images/
 tests/test_results*
 
 # Jupyter notebooks checkpoints
