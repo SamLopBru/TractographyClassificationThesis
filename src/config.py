@@ -35,6 +35,7 @@ class TrainConfig:
     num_classes: int = 32
     dropout: float = 0.1
     pooling: str = "mean"       # "cls", "mean", or "max"
+    pos_encoding: str = "absolute"  # "absolute" or "rope"
     
     # Training configuration
     epochs: int = 20            # More epochs for convergence
@@ -65,6 +66,8 @@ class TrainConfig:
             f"encoder_type must be 'transformer' or 'lstm', got {self.encoder_type}"
         assert self.pooling in ["cls", "mean", "max"], \
             f"pooling must be 'cls', 'mean', or 'max', got {self.pooling}"
+        assert self.pos_encoding in ["absolute", "rope"], \
+            f"pos_encoding must be 'absolute' or 'rope', got {self.pos_encoding}"
         assert 0 < self.sampling_pct <= 1, \
             f"sampling_pct must be between 0 and 1, got {self.sampling_pct}"
         assert 0 < self.epoch_sampling_pct <= 1, \

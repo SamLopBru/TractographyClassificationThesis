@@ -9,16 +9,16 @@ contrastive pre-training checkpoints (pretrained_encoder.pt).
 
 Usage:
     # Visualize from a classification checkpoint
-    uv run src/visualize_embeddings.py --checkpoint checkpoints/best_model.pt --data_dir sequences/validset
+    uv run utils/visualize_embeddings.py --checkpoint checkpoints/best_model.pt --data_dir sequences/validset
 
     # Visualize from a contrastive pre-training checkpoint
-    uv run src/visualize_embeddings.py --checkpoint checkpoints/contrastive/pretrained_encoder.pt --data_dir sequences/validset
+    uv run utils/visualize_embeddings.py --checkpoint checkpoints/contrastive/pretrained_encoder.pt --data_dir sequences/validset
 
     # Limit samples for faster visualization
-    uv run src/visualize_embeddings.py --checkpoint checkpoints/best_model.pt --max_samples 5000
+    uv run utils/visualize_embeddings.py --checkpoint checkpoints/best_model.pt --max_samples 5000
 
     # Use UMAP instead of t-SNE (requires umap-learn package)
-    uv run src/visualize_embeddings.py --checkpoint checkpoints/best_model.pt --method umap
+    uv run utils/visualize_embeddings.py --checkpoint checkpoints/best_model.pt --method umap
 """
 
 import torch

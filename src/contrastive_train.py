@@ -464,7 +464,7 @@ def contrastive_train(
                 )
                 print(f"  [EMA] Val Loss: {ema_val['loss']:.4f}")
         else:
-            val_metrics = {'loss': history['val_loss'][-1] if history['val_loss'] else 0,
+            val_metrics = {'loss': history['val_loss'][-1] if history['val_loss'] else float('inf'),
                           'alignment': 0, 'uniformity': 0}
             print("  [Skipping validation this epoch]")
         
@@ -629,6 +629,8 @@ def main():
     parser.add_argument('--dropout', type=float, default=cfg.dropout)
     parser.add_argument('--pooling', type=str, default='cls',
                         choices=['cls', 'mean', 'max', 'last'])
+    parser.add_argument('--pos_encoding', type=str, default=cfg.pos_encoding,
+                        choices=['absolute', 'rope'], help='Positional encoding type (transformer only)')
     
     # Contrastive-specific arguments
     parser.add_argument('--temperature', type=float, default=0.07,
@@ -729,7 +731,8 @@ def main():
             dim_feedforward=args.dim_feedforward,
             num_classes=cfg.num_classes,  # Required by __init__, but classifier won't be used
             dropout=args.dropout,
-            pooling=args.pooling
+            pooling=args.pooling,
+            pos_encoding=args.pos_encoding
         )
         embedding_dim = args.d_model
     else:

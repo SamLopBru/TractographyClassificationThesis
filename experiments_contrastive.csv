@@ -1,0 +1,2 @@
+timestamp,experiment,encoder_type,best_val_loss,best_epoch,total_epochs,final_train_loss,final_val_loss,final_alignment,best_alignment,final_uniformity,best_uniformity,mean_epoch_time,d_model,num_layers,nhead,temperature,projection_dim,lr,batch_size,accumulation_steps,dropout,pooling,warmup_steps,sampling_pct,epoch_sampling_pct,parameters
+2026-02-12 15:21:48,transformer_d256_L6_t0.07,transformer,6.9882,4,19,4.2370,7.0051,0.0000,0.0000,0.0000,-0.0205,462.8,256,6,8,0.07,128,0.0004,1024,4,0.1,cls,1500,0.1,0.1,3238944

@@ -29,7 +29,166 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-class StreamlineEncoder(nn.Module):
+class RotaryPositionalEncoding(nn.Module):
+    """Rotary Positional Encoding (RoPE).
+    
+    Encodes relative positions by rotating Q/K vectors using sinusoidal
+    frequencies. Unlike absolute PE, this is applied inside each attention
+    layer to the query and key projections.
+    
+    Reference: "RoFormer: Enhanced Transformer with Rotary Position Embedding"
+               (Su et al., 2021)
+    """
+    
+    def __init__(self, d_head: int, max_len: int = 5000):
+        super().__init__()
+        assert d_head % 2 == 0, f"d_head must be even for RoPE, got {d_head}"
+        
+        # Precompute frequency bands: theta_i = 1 / 10000^(2i/d)
+        freqs = 1.0 / (10000.0 ** (torch.arange(0, d_head, 2).float() / d_head))
+        positions = torch.arange(max_len).float()
+        # (max_len, d_head/2)
+        angles = torch.outer(positions, freqs)
+        # Store as complex exponentials for efficient rotation
+        # (max_len, d_head/2) complex
+        self.register_buffer('cos_cached', angles.cos())
+        self.register_buffer('sin_cached', angles.sin())
+    
+    def forward(self, x: torch.Tensor, offset: int = 0) -> torch.Tensor:
+        """Apply rotary encoding to input tensor.
+        
+        Args:
+            x: Tensor of shape (..., seq_len, d_head)
+            offset: Position offset (for cached KV in generation)
+        
+        Returns:
+            Rotated tensor of same shape
+        """
+        seq_len = x.shape[-2]
+        cos = self.cos_cached[offset:offset + seq_len]  # (seq_len, d_head/2)
+        sin = self.sin_cached[offset:offset + seq_len]  # (seq_len, d_head/2)
+        
+        # Split into pairs and rotate
+        x1 = x[..., 0::2]  # Even indices
+        x2 = x[..., 1::2]  # Odd indices
+        
+        # Apply rotation: [x1, x2] -> [x1*cos - x2*sin, x1*sin + x2*cos]
+        rotated = torch.stack([
+            x1 * cos - x2 * sin,
+            x1 * sin + x2 * cos
+        ], dim=-1).flatten(-2)
+        
+        return rotated
+
+
+class RoPETransformerEncoderLayer(nn.Module):
+    """Transformer encoder layer with Rotary Positional Encoding.
+    
+    Implements the same pre-norm architecture as
+    nn.TransformerEncoderLayer(norm_first=True), but applies RoPE
+    to Q and K inside the attention computation.
+    
+    Architecture: LayerNorm -> MHA(RoPE) -> Residual -> LayerNorm -> FFN -> Residual
+    """
+    
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        max_len: int = 5000
+    ):
+        super().__init__()
+        assert d_model % nhead == 0, f"d_model ({d_model}) must be divisible by nhead ({nhead})"
+        
+        self.d_model = d_model
+        self.nhead = nhead
+        self.d_head = d_model // nhead
+        
+        # Q, K, V projections
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        
+        # RoPE
+        self.rope = RotaryPositionalEncoding(self.d_head, max_len)
+        
+        # Feedforward
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+            nn.Dropout(dropout)
+        )
+        
+        # Layer norms (pre-norm)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        
+        # Dropout for attention
+        self.attn_dropout = nn.Dropout(dropout)
+    
+    def forward(
+        self,
+        src: torch.Tensor,
+        src_key_padding_mask: torch.Tensor = None
+    ) -> torch.Tensor:
+        """Forward pass with RoPE attention.
+        
+        Args:
+            src: (batch_size, seq_len, d_model)
+            src_key_padding_mask: (batch_size, seq_len) True = padding
+        
+        Returns:
+            (batch_size, seq_len, d_model)
+        """
+        batch_size, seq_len, _ = src.shape
+        
+        # Pre-norm self-attention with RoPE
+        x = self.norm1(src)
+        
+        # Project Q, K, V and reshape for multi-head
+        # (batch, seq, d_model) -> (batch, nhead, seq, d_head)
+        q = self.q_proj(x).view(batch_size, seq_len, self.nhead, self.d_head).transpose(1, 2)
+        k = self.k_proj(x).view(batch_size, seq_len, self.nhead, self.d_head).transpose(1, 2)
+        v = self.v_proj(x).view(batch_size, seq_len, self.nhead, self.d_head).transpose(1, 2)
+        
+        # Apply RoPE to Q and K
+        q = self.rope(q)
+        k = self.rope(k)
+        
+        # Build attention mask from padding mask
+        attn_mask = None
+        if src_key_padding_mask is not None:
+            # (batch, seq) -> (batch, 1, 1, seq) for broadcasting
+            attn_mask = src_key_padding_mask.unsqueeze(1).unsqueeze(2)
+            attn_mask = attn_mask.to(dtype=q.dtype)
+            attn_mask = attn_mask.masked_fill(attn_mask.bool(), float('-inf'))
+        
+        # Scaled dot-product attention (uses Flash Attention when available)
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.attn_dropout.p if self.training else 0.0
+        )
+        
+        # Reshape back: (batch, nhead, seq, d_head) -> (batch, seq, d_model)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        attn_out = self.out_proj(attn_out)
+        
+        # Residual connection
+        x = src + self.attn_dropout(attn_out)
+        
+        # Pre-norm feedforward + residual
+        x = x + self.ff(self.norm2(x))
+        
+        return x
+
+
+class TransformerEncoder(nn.Module):
     """
     Transformer-based encoder for classifying streamlines into bundles.
     
@@ -47,7 +206,8 @@ class StreamlineEncoder(nn.Module):
         num_classes: int = 32,
         max_len: int = 5000,
         dropout: float = 0.1,
-        pooling: str = 'cls'  # 'cls', 'mean', or 'max'
+        pooling: str = 'cls',  # 'cls', 'mean', or 'max'
+        pos_encoding: str = 'absolute'  # 'absolute' or 'rope'
     ):
         """
         Args:
@@ -65,6 +225,7 @@ class StreamlineEncoder(nn.Module):
         
         self.d_model = d_model
         self.pooling = pooling
+        self.pos_encoding = pos_encoding
         
         # Input projection: (batch, seq, 5) -> (batch, seq, d_model)
         self.input_projection = nn.Linear(input_size, d_model)
@@ -73,23 +234,36 @@ class StreamlineEncoder(nn.Module):
         if pooling == 'cls':
             self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
         
-        # Positional encoding
-        self.pos_encoder = PositionalEncoding(d_model, max_len, dropout)
-        
-        # Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=True  # Pre-norm for better training stability
-        )
-        self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer, 
-            num_layers=num_layers,
-            enable_nested_tensor=True
-        )
+        if pos_encoding == 'rope':
+            # RoPE: positional info is injected inside each attention layer
+            self.pos_encoder = None
+            rope_layers = nn.ModuleList([
+                RoPETransformerEncoderLayer(
+                    d_model=d_model,
+                    nhead=nhead,
+                    dim_feedforward=dim_feedforward,
+                    dropout=dropout,
+                    max_len=max_len
+                )
+                for _ in range(num_layers)
+            ])
+            self.transformer_encoder = rope_layers
+        else:
+            # Absolute sinusoidal positional encoding (default)
+            self.pos_encoder = PositionalEncoding(d_model, max_len, dropout)
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                batch_first=True,
+                norm_first=True  # Pre-norm for better training stability
+            )
+            self.transformer_encoder = nn.TransformerEncoder(
+                encoder_layer, 
+                num_layers=num_layers,
+                enable_nested_tensor=True
+            )
         
         # Classification head
         self.classifier = nn.Sequential(
@@ -144,13 +318,16 @@ class StreamlineEncoder(nn.Module):
                 cls_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=x.device)
                 padding_mask = torch.cat([cls_mask, padding_mask], dim=1)
         
-        # Positional encoding
-        x = x.transpose(0, 1)
-        x = self.pos_encoder(x)
-        x = x.transpose(0, 1)
-        
-        # Transformer encoder
-        x = self.transformer_encoder(x, src_key_padding_mask=padding_mask)
+        if self.pos_encoding == 'rope':
+            # RoPE: no absolute PE, pass through custom RoPE layers
+            for layer in self.transformer_encoder:
+                x = layer(x, src_key_padding_mask=padding_mask)
+        else:
+            # Absolute PE
+            x = x.transpose(0, 1)
+            x = self.pos_encoder(x)
+            x = x.transpose(0, 1)
+            x = self.transformer_encoder(x, src_key_padding_mask=padding_mask)
         
         # Pool the sequence
         if self.pooling == 'cls':
@@ -191,7 +368,7 @@ class StreamlineEncoder(nn.Module):
         return logits
 
 
-class LightweightStreamlineEncoder(nn.Module):
+class LSTMEncoder(nn.Module):
     """
     A lighter LSTM-based encoder for faster training/inference.
     
@@ -344,7 +521,6 @@ class LightweightStreamlineEncoder(nn.Module):
         return logits
 
 
-
 class ProjectionHead(nn.Module):
     """
     MLP projection head for contrastive learning.
@@ -395,7 +571,11 @@ def create_encoder(
         Encoder module
     """
     if encoder_type == 'transformer':
-        return StreamlineEncoder(num_classes=num_classes, **kwargs)
+        # Filter out LSTM-only kwargs
+        valid_keys = {'input_size', 'd_model', 'nhead', 'num_layers', 'dim_feedforward',
+                      'max_len', 'dropout', 'pooling', 'pos_encoding'}
+        filtered = {k: v for k, v in kwargs.items() if k in valid_keys}
+        return StreamlineEncoder(num_classes=num_classes, **filtered)
     elif encoder_type == 'lstm':
         return LightweightStreamlineEncoder(num_classes=num_classes, **kwargs)
     else:

@@ -66,7 +66,8 @@ def load_model(
             dim_feedforward=config.dim_feedforward,
             num_classes=config.num_classes,
             dropout=config.dropout,
-            pooling="cls"
+            pooling="cls",
+            pos_encoding=config.pos_encoding
         )
     else:
         model = LightweightStreamlineEncoder(
@@ -481,6 +482,9 @@ def main():
                         help='Disable mixed precision')
     parser.add_argument('--sampling_pct', type=float, default=0.25,
                         help='Percentage of test data to use (1.0 = all)')
+    parser.add_argument('--pos_encoding', type=str, default=cfg.pos_encoding,
+                        choices=['absolute', 'rope'],
+                        help='Positional encoding type (must match trained model)')
     
     args = parser.parse_args()
     
@@ -493,6 +497,7 @@ def main():
     
     # Load model
     print(f"\nLoading model from {args.checkpoint}")
+    cfg.pos_encoding = args.pos_encoding
     model, checkpoint = load_model(args.checkpoint, cfg, device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     

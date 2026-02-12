@@ -10,5 +10,5 @@ pretrained_encoder: uv run src/contrastive_train.py \
   --temperature 0.07 \
   --validate_every 2
 
-encoder_transformer: uv run src/train.py --pooling cls --epochs 40 --patience 10 \
+encoder_transformer: uv run src/train.py --epochs 40 --patience 10 \
 --warmup_steps 1500 --batch_size 1024 --pooling cls --accumulation_steps 2

@@ -34,8 +34,8 @@ if torch.cuda.is_available():
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 
-from src.encoder import StreamlineEncoder, LightweightStreamlineEncoder
-from src.dataloader import StreamlineDataset, StratifiedEpochSampler, EpochSubsetSampler, streamline_collate_fn
+from src.encoder import TransformerEncoder, LSTMEncoder
+from utils.dataloader import StreamlineDataset, StratifiedEpochSampler, EpochSubsetSampler, streamline_collate_fn
 from src.config import TrainConfig, DEFAULT_CONFIG
 
 
@@ -609,6 +609,8 @@ def main():
                         help='Dropout rate')
     parser.add_argument('--pooling', type=str, default=cfg.pooling,
                         choices=['cls', 'mean', 'max', 'last'], help='Pooling strategy (last only for LSTM)')
+    parser.add_argument('--pos_encoding', type=str, default=cfg.pos_encoding,
+                        choices=['absolute', 'rope'], help='Positional encoding type (transformer only)')
     
     # Training arguments
     parser.add_argument('--epochs', type=int, default=cfg.epochs,
@@ -729,7 +731,8 @@ def main():
             dim_feedforward=args.dim_feedforward,
             num_classes=args.num_classes,
             dropout=args.dropout,
-            pooling=args.pooling
+            pooling=args.pooling,
+            pos_encoding=args.pos_encoding
         )
     else:
         model = LightweightStreamlineEncoder(
@@ -840,6 +843,7 @@ def main():
             'weight_decay': weight_decay,
             'use_ema': not args.no_ema,
             'pretrained': args.pretrained_encoder is not None,
+            'pos_encoding': args.pos_encoding,
             'sampling_pct': args.sampling_pct,
             'epoch_sampling_pct': args.epoch_sampling_pct,
         },
