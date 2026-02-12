@@ -34,8 +34,8 @@ if torch.cuda.is_available():
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 
-from src.encoder import StreamlineEncoder, LightweightStreamlineEncoder
-from src.dataloader import StreamlineDataset, StratifiedEpochSampler, EpochSubsetSampler, streamline_collate_fn
+from src.encoder import TransformerEncoder, LSTMEncoder
+from utils.dataloader import StreamlineDataset, StratifiedEpochSampler, EpochSubsetSampler, streamline_collate_fn
 from src.config import TrainConfig, DEFAULT_CONFIG
 
 

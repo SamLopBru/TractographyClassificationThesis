@@ -188,7 +188,7 @@ class RoPETransformerEncoderLayer(nn.Module):
         return x
 
 
-class StreamlineEncoder(nn.Module):
+class TransformerEncoder(nn.Module):
     """
     Transformer-based encoder for classifying streamlines into bundles.
     
@@ -368,7 +368,7 @@ class StreamlineEncoder(nn.Module):
         return logits
 
 
-class LightweightStreamlineEncoder(nn.Module):
+class LSTMEncoder(nn.Module):
     """
     A lighter LSTM-based encoder for faster training/inference.
     
@@ -519,7 +519,6 @@ class LightweightStreamlineEncoder(nn.Module):
         pooled = self.get_embeddings(x, lengths, padding_mask)
         logits = self.classifier(pooled)
         return logits
-
 
 
 class ProjectionHead(nn.Module):
