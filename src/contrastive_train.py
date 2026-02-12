@@ -35,6 +35,7 @@ import argparse
 import copy
 import gc
 from datetime import datetime
+import json
 from typing import Dict, List
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -527,6 +528,10 @@ def contrastive_train(
             torch.cuda.empty_cache()
     
     writer.close()
+
+    # Save training history as JSON
+    with open(os.path.join(save_dir, 'history.json'), 'w') as f:
+        json.dump(history, f, indent=2)
     
     print(f"\n{'='*60}")
     print(f"Contrastive pre-training complete! Best val loss: {best_val_loss:.4f}")

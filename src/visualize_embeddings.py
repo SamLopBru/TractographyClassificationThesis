@@ -194,7 +194,7 @@ def plot_tsne(
         n_components=2,
         perplexity=perplexity,
         random_state=42,
-        n_iter=1000,
+        max_iter=1000,
         learning_rate='auto',
         init='pca'
     )
@@ -381,7 +381,7 @@ def main():
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=False,
+        shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
         collate_fn=streamline_collate_fn
