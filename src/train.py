@@ -723,7 +723,7 @@ def main():
     
     # Create model
     if args.encoder_type == 'transformer':
-        model = StreamlineEncoder(
+        model = TransformerEncoder(
             input_size=cfg.input_size,
             d_model=args.d_model,
             nhead=args.nhead,
@@ -735,7 +735,7 @@ def main():
             pos_encoding=args.pos_encoding
         )
     else:
-        model = LightweightStreamlineEncoder(
+        model = LSTMEncoder(
             input_size=cfg.input_size,
             hidden_size=args.d_model,
             num_layers=args.num_layers,

@@ -34,7 +34,7 @@ class TrainConfig:
     dim_feedforward: int = 512  # 2x d_model ratio
     num_classes: int = 32
     dropout: float = 0.1
-    pooling: str = "mean"       # "cls", "mean", or "max"
+    pooling: str = "cls"       # "cls", "mean", or "max"
     pos_encoding: str = "absolute"  # "absolute" or "rope"
     
     # Training configuration
@@ -47,7 +47,7 @@ class TrainConfig:
     accumulation_steps: int = 2
     patience: int = 5           # Early Stop patience
     use_amp: bool = True        # Essential for memory
-    warmup_steps: int = 500     # Warmup by steps (more consistent than epochs)
+    warmup_steps: int = 1500     # Warmup by steps (more consistent than epochs)
     plateau_patience: int = 3   # Epochs before LR reduction on plateau
     plateau_factor: float = 0.5 # LR reduction factor on plateau
     max_grad_norm: float = 1.0  # Maximum gradient norm for clipping

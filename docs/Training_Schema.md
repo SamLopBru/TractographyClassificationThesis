@@ -10,8 +10,8 @@ The system classifies individual streamlines (variable-length sequences of 3D po
 
 | Architecture | Class | Key Properties |
 |---|---|---|
-| **Transformer** | `StreamlineEncoder` | Self-attention, positional encoding, pre-norm |
-| **LSTM** | `LightweightStreamlineEncoder` | Bidirectional, packed sequences |
+| **Transformer** | `TransformerEncoder` | Self-attention, positional encoding, pre-norm |
+| **LSTM** | `LSTMEncoder` | Bidirectional, packed sequences |
 
 The pipeline is implemented across four modules:
 
