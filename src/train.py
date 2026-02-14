@@ -573,7 +573,9 @@ def main():
     cfg = DEFAULT_CONFIG
     
     parser = argparse.ArgumentParser(description='Train Streamline Bundle Classifier')
-    
+
+    parser.add_argument('--experiment_name', type=str, default=None,
+                        help='Name/description of this experiment')
     # Data arguments
     parser.add_argument('--train_dir', type=str, default=cfg.train_dir,
                         help='Directory containing training HDF5 files')
@@ -818,7 +820,7 @@ def main():
     
     # Log experiment results to CSV
     log_experiment(
-        experiment_name=f"{args.encoder_type}_d{args.d_model}_L{args.num_layers}",
+        experiment_name= f"{args.encoder_type}_d{args.d_model}_L{args.num_layers}" if args.experiment_name == None else args.experiment_name,
         encoder_type=args.encoder_type,
         history=history,
         params={
