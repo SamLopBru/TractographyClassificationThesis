@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import math
 
-class PositionalEncoding(nn.Module):
+class SinusoidalPositionalEncoding(nn.Module):
     """Standard sinusoidal positional encoding for sequences."""
     
     def __init__(self, d_model: int, max_len: int = 5000, dropout: float = 0.1):
