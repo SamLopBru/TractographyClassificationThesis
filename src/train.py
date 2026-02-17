@@ -646,6 +646,10 @@ def main():
     parser.add_argument('--scheduler', type=str, default=cfg.scheduler,
                         choices=['cosine_plateau', 'cosine_only'],
                         help='LR scheduler type: cosine_plateau (default) or cosine_only')
+    parser.add_argument('--weight_decay_transformer', type=float, default=cfg.weight_decay_transformer,
+                        help='Weight decay for Transformer')
+    parser.add_argument('--weight_decay_lstm', type=float, default=cfg.weight_decay_lstm,
+                        help='Weight decay for LSTM ')
     
     # System arguments
     parser.add_argument('--num_workers', type=int, default=cfg.num_workers,
@@ -797,10 +801,10 @@ def main():
     
     # Architecture-specific weight decay
     if args.encoder_type == 'transformer':
-        weight_decay = cfg.weight_decay_transformer
+        weight_decay = args.weight_decay_transformer
         print(f"Using Transformer weight decay: {weight_decay:.2e}")
     else:
-        weight_decay = cfg.weight_decay_lstm
+        weight_decay = args.weight_decay_lstm
         print(f"Using LSTM weight decay: {weight_decay:.2e}")
     
     # Train
