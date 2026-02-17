@@ -47,8 +47,9 @@ class TrainConfig:
     accumulation_steps: int = 2
     patience: int = 5           # Early Stop patience
     use_amp: bool = True        # Essential for memory
-    warmup_steps: int = 1500     # Warmup by steps (more consistent than epochs)
-    plateau_patience: int = 3   # Epochs before LR reduction on plateau
+    warmup_steps: int = 1500    # Warmup by steps (more consistent than epochs)
+    scheduler: str = "cosine_plateau"  # "cosine_plateau" or "cosine_only"
+    plateau_patience: int = 5   # Epochs before LR reduction on plateau
     plateau_factor: float = 0.5 # LR reduction factor on plateau
     max_grad_norm: float = 1.0  # Maximum gradient norm for clipping
     use_ema: bool = True        # Use Exponential Moving Average
@@ -68,6 +69,8 @@ class TrainConfig:
             f"pooling must be 'cls', 'mean', or 'max', got {self.pooling}"
         assert self.pos_encoding in ["absolute", "rope"], \
             f"pos_encoding must be 'absolute' or 'rope', got {self.pos_encoding}"
+        assert self.scheduler in ["cosine_plateau", "cosine_only"], \
+            f"scheduler must be 'cosine_plateau' or 'cosine_only', got {self.scheduler}"
         assert 0 < self.sampling_pct <= 1, \
             f"sampling_pct must be between 0 and 1, got {self.sampling_pct}"
         assert 0 < self.epoch_sampling_pct <= 1, \

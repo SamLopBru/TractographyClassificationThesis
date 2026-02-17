@@ -241,7 +241,8 @@ def train(
     resume_checkpoint: str = None,
     use_ema: bool = True,
     ema_decay: float = 0.999,
-    validate_every: int = 1
+    validate_every: int = 1,
+    scheduler_type: str = "cosine_plateau"
 ) -> Dict[str, List[float]]:
     """
     Full training loop with validation, early stopping, warmup, and mixed precision.
@@ -284,16 +285,22 @@ def train(
     warmup_cosine_scheduler = optim.lr_scheduler.LambdaLR(optimizer, warmup_cosine_schedule_fn)
     
     # Backup scheduler: ReduceLROnPlateau for when validation loss plateaus
-    plateau_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 
-        mode='min',  # Monitor validation loss
-        factor=plateau_factor,
-        patience=plateau_patience,
-        min_lr=1e-7
-    )
+    use_plateau = scheduler_type == "cosine_plateau"
+    plateau_scheduler = None
+    if use_plateau:
+        plateau_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 
+            mode='min',  # Monitor validation loss
+            factor=plateau_factor,
+            patience=plateau_patience,
+            min_lr=1e-7
+        )
     
     print(f"Scheduler: {warmup_steps} steps warmup + cosine annealing (total {total_steps} steps)")
-    print(f"Plateau LR reduction: factor={plateau_factor}, patience={plateau_patience}")
+    if use_plateau:
+        print(f"Plateau LR reduction: factor={plateau_factor}, patience={plateau_patience}")
+    else:
+        print(f"Pure cosine annealing (no plateau fallback)")
     
     # EMA model for better final quality
     ema_model = None
@@ -407,8 +414,9 @@ def train(
                 ema_val_metrics = validate(ema_model, val_loader, criterion, device, use_amp=use_amp)
                 print(f"  [EMA] Val Loss: {ema_val_metrics['loss']:.4f} | Val Acc: {ema_val_metrics['accuracy']:.2f}% | Val F1: {ema_val_metrics['macro_f1']:.2f}%")
             
-            # Plateau scheduler uses val loss
-            plateau_scheduler.step(val_metrics['loss'])
+            # Plateau scheduler uses val loss (only if enabled)
+            if plateau_scheduler is not None:
+                plateau_scheduler.step(val_metrics['loss'])
         else:
             # Use placeholder metrics when skipping validation
             val_metrics = {'loss': history['val_loss'][-1] if history['val_loss'] else 0, 
@@ -474,7 +482,7 @@ def train(
             'ema_model_state_dict': ema_model.state_dict() if ema_model is not None else None,
             'optimizer_state_dict': optimizer.state_dict(),
             'warmup_cosine_scheduler_state': warmup_cosine_scheduler.state_dict(),
-            'plateau_scheduler_state': plateau_scheduler.state_dict(),
+            'plateau_scheduler_state': plateau_scheduler.state_dict() if plateau_scheduler is not None else None,
             'scaler_state': scaler.state_dict() if scaler is not None else None,
             'best_val_f1': best_val_f1,
             'patience_counter': patience_counter,
@@ -635,6 +643,9 @@ def main():
                         help='Validate every N epochs')
     parser.add_argument('--warmup_steps', type=int, default=cfg.warmup_steps,
                         help='Number of warmup steps')
+    parser.add_argument('--scheduler', type=str, default=cfg.scheduler,
+                        choices=['cosine_plateau', 'cosine_only'],
+                        help='LR scheduler type: cosine_plateau (default) or cosine_only')
     
     # System arguments
     parser.add_argument('--num_workers', type=int, default=cfg.num_workers,
@@ -815,7 +826,8 @@ def main():
         resume_checkpoint=args.resume,
         use_ema=not args.no_ema,
         ema_decay=cfg.ema_decay,
-        validate_every=args.validate_every
+        validate_every=args.validate_every,
+        scheduler_type=args.scheduler
     )
     
     # Log experiment results to CSV
@@ -840,6 +852,7 @@ def main():
             'val_sampling_pct': args.val_sampling_pct,
             'num_workers': args.num_workers,
             'warmup_steps': args.warmup_steps,
+            'scheduler': args.scheduler,
             'plateau_patience': cfg.plateau_patience,
             'plateau_factor': cfg.plateau_factor,
             'weight_decay': weight_decay,
