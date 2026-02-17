@@ -529,9 +529,11 @@ def log_experiment(
     # Get best metrics
     best_val_f1 = max(history['val_f1']) if history['val_f1'] else 0
     best_val_acc = max(history['val_acc']) if history['val_acc'] else 0
-    best_epoch = history['val_f1'].index(best_val_f1) + 1 if history['val_f1'] else 0
-    final_train_loss = history['train_loss'][-1] if history['train_loss'] else 0
-    final_val_loss = history['val_loss'][-1] if history['val_loss'] else 0
+    best_epoch_idx = history['val_f1'].index(best_val_f1) if history['val_f1'] else 0
+    best_epoch = best_epoch_idx + 1
+    # Losses at the best epoch (more meaningful than final epoch losses)
+    best_train_loss = history['train_loss'][best_epoch_idx] if history['train_loss'] else 0
+    best_val_loss = history['val_loss'][best_epoch_idx] if history['val_loss'] else 0
     mean_epoch_time = sum(history.get('epoch_time', [0])) / max(1, len(history.get('epoch_time', [1])))
     
     # Create row
@@ -544,8 +546,8 @@ def log_experiment(
         'best_epoch': best_epoch,
         'total_epochs': len(history['train_loss']),
         'mean_epoch_time': f"{mean_epoch_time:.1f}",
-        'final_train_loss': f"{final_train_loss:.4f}",
-        'final_val_loss': f"{final_val_loss:.4f}",
+        'best_train_loss': f"{best_train_loss:.4f}",
+        'best_val_loss': f"{best_val_loss:.4f}",
         'd_model': params.get('d_model', ''),
         'dim_feedforward': params.get('dim_feedforward', ''),
         'num_layers': params.get('num_layers', ''),
