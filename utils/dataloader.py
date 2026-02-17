@@ -137,13 +137,19 @@ class StratifiedEpochSampler(Sampler[int]):
                     self.class_indices[tract_id] = []
                 self.class_indices[tract_id].append(idx)
         
+        # Adaptive threshold: 5% of the largest class size
+        max_class_size = max(len(indices) for indices in self.class_indices.values())
+        adaptive_threshold = int(max_class_size * 0.05)
+        if self.full_sample_threshold is not None:
+            adaptive_threshold = max(adaptive_threshold, self.full_sample_threshold)
+        
         # Calculate samples per class
         self.samples_per_class = {}
         total_samples = 0
         for tract_id, indices in self.class_indices.items():
             n_available = len(indices)
-            # If class has fewer than threshold, take all samples
-            if n_available < self.full_sample_threshold:
+            # If class has fewer than adaptive threshold, take all samples
+            if n_available < adaptive_threshold:
                 n_to_sample = n_available
             else:
                 n_percentage = int(n_available * sampling_percentage)
@@ -155,7 +161,8 @@ class StratifiedEpochSampler(Sampler[int]):
         self.n_samples = total_samples
         
         print(f"StratifiedEpochSampler: {self.n_samples} samples per epoch "
-              f"({self.sampling_percentage*100:.1f}% per class, full if <{self.full_sample_threshold})")
+              f"({self.sampling_percentage*100:.1f}% per class, full if <{adaptive_threshold} "
+              f"[5% of max class={max_class_size}])")
         # for tract_id in sorted(self.samples_per_class.keys()):
         #     print(f"  Class {tract_id}: {self.samples_per_class[tract_id]} / {len(self.class_indices[tract_id])}")
     
@@ -256,52 +263,65 @@ class StreamlineDataset(Dataset):
         
         rng = np.random.default_rng(self.seed)
         
-        # Collect index entries as list first, then convert to NumPy
-        index_entries = []
+        # First pass: find the max bundle size across all files to compute adaptive threshold
+        all_tract_sizes = []
+        tract_metadata = []  # Store (file_path, group_name, file_id, group_id, tract_id, n_available)
         
         for file_path in self.file_paths:
             file_id = self.file_path_to_id[file_path]
-            
             with h5py.File(file_path, 'r') as f:
                 for group_name in f.keys():
                     if not group_name.startswith('tract_'):
                         continue
-                    
-                    # Extract group number from 'tract_XX'
                     group_id = int(group_name.split('_')[1])
-                    
                     tract_group = f[group_name]
-                    tract_id = tract_group.attrs['tract_id']
-                    n_available = tract_group.attrs['n_streamlines']
-                    lengths = tract_group['lengths'][:]
-                    
-                    # Calculate how many streamlines to sample
-                    if n_available < self.full_sample_threshold:
-                        n_to_sample = n_available
-                    else:
-                        n_percentage = int(n_available * self.sampling_percentage)
-                        n_to_sample = max(self.min_streamlines, n_percentage)
-                    
-                    if self.max_streamlines_per_tract is not None:
-                        n_to_sample = min(n_to_sample, self.max_streamlines_per_tract)
-                    
-                    n_to_sample = min(n_to_sample, n_available)
-                    
-                    # Sample indices using seeded RNG
-                    if n_to_sample < n_available:
-                        sampled_indices = np.sort(rng.choice(n_available, n_to_sample, replace=False))
-                    else:
-                        sampled_indices = np.arange(n_available)
-                    
-                    # Add entries as tuples (will become structured array rows)
-                    for idx in sampled_indices:
-                        index_entries.append((
-                            file_id,
-                            group_id,
-                            int(idx),
-                            int(lengths[idx]),
-                            int(tract_id)
-                        ))
+                    tract_id = int(tract_group.attrs['tract_id'])
+                    n_available = int(tract_group.attrs['n_streamlines'])
+                    all_tract_sizes.append(n_available)
+                    tract_metadata.append((file_path, group_name, file_id, group_id, tract_id, n_available))
+        
+        # Adaptive threshold: 5% of the largest bundle
+        max_bundle_size = max(all_tract_sizes) if all_tract_sizes else 1000
+        adaptive_threshold = int(max_bundle_size * 0.05)
+        if self.full_sample_threshold is not None:
+            adaptive_threshold = max(adaptive_threshold, self.full_sample_threshold)
+        print(f"  Adaptive full-sample threshold: {adaptive_threshold} "
+              f"(5% of max bundle={max_bundle_size})")
+        
+        # Second pass: sample streamlines using the adaptive threshold
+        index_entries = []
+        
+        for file_path, group_name, file_id, group_id, tract_id, n_available in tract_metadata:
+            with h5py.File(file_path, 'r') as f:
+                lengths = f[group_name]['lengths'][:]
+            
+            # Calculate how many streamlines to sample
+            if n_available < adaptive_threshold:
+                n_to_sample = n_available
+            else:
+                n_percentage = int(n_available * self.sampling_percentage)
+                n_to_sample = max(self.min_streamlines, n_percentage)
+            
+            if self.max_streamlines_per_tract is not None:
+                n_to_sample = min(n_to_sample, self.max_streamlines_per_tract)
+            
+            n_to_sample = min(n_to_sample, n_available)
+            
+            # Sample indices using seeded RNG
+            if n_to_sample < n_available:
+                sampled_indices = np.sort(rng.choice(n_available, n_to_sample, replace=False))
+            else:
+                sampled_indices = np.arange(n_available)
+            
+            # Add entries as tuples (will become structured array rows)
+            for idx in sampled_indices:
+                index_entries.append((
+                    file_id,
+                    group_id,
+                    int(idx),
+                    int(lengths[idx]),
+                    int(tract_id)
+                ))
         
         # Convert to NumPy structured array (huge memory savings)
         self.streamline_index = np.array(index_entries, dtype=self.INDEX_DTYPE)
