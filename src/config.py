@@ -28,9 +28,9 @@ class TrainConfig:
     # Model configuration
     encoder_type: str = "transformer"  # "transformer" or "lstm"
     input_size: int = 5
-    d_model: int = 256          # Larger for better capacity
+    d_model: int = 256          
     nhead: int = 8              # 256 / 8 = 32 dim per head
-    num_layers: int = 6         # Deeper representations
+    num_layers: int = 6         
     dim_feedforward: int = 512  # 2x d_model ratio
     num_classes: int = 32
     dropout: float = 0.1
@@ -38,28 +38,33 @@ class TrainConfig:
     pos_encoding: str = "absolute"  # "absolute" or "rope"
     
     # Training configuration
-    epochs: int = 20            # More epochs for convergence
-    batch_size: int = 1024      # Safe for 16GB with d_model=256
-    base_lr: float = 1e-4       # Base LR (will be scaled by batch size)
+    epochs: int = 20            
+    batch_size: int = 1024      
+    base_lr: float = 1e-4       # Base LR (will be scaled by effective batch size)
     lr_scale_with_batch: bool = True  # Scale LR with sqrt(batch_size/256)
     weight_decay_transformer: float = 1e-4  # Weight decay for Transformer
     weight_decay_lstm: float = 1e-5         # Weight decay for LSTM (lower)
     accumulation_steps: int = 2
     patience: int = 5           # Early Stop patience
-    use_amp: bool = True        # Essential for memory
-    warmup_steps: int = 1500    # Warmup by steps (more consistent than epochs)
-    scheduler: str = "cosine_plateau"  # "cosine_plateau" or "cosine_only"
+    label_smoothing: float = 0.1  # Label smoothing for CrossEntropyLoss (0.0 = disabled)
+    use_amp: bool = True        # Activate Automatic Mixed Precision
+    warmup_steps: int = 1500    # Warmup by steps 
+    scheduler: str = "cosine_plateau"  # "cosine_plateau", "cosine_only" or "cosine_restarts"
     plateau_patience: int = 5   # Epochs before LR reduction on plateau
     plateau_factor: float = 0.5 # LR reduction factor on plateau
     max_grad_norm: float = 1.0  # Maximum gradient norm for clipping
     use_ema: bool = True        # Use Exponential Moving Average
     ema_decay: float = 0.999    # EMA decay factor
-    validate_every: int = 2     # Validate every N epochs (2 during warmup)
+    validate_every: int = 2     # Validate every N epochs
+    
+    # Cosine Annealing with Warm Restarts configuration
+    T_0: int = 10               # Number of epochs for the first restart
+    T_mult: int = 2             # Factor to increase the cycle length after each restart
     
     # System configuration
     num_workers: int = 8        
     save_dir: str = "checkpoints"
-    log_interval: int = 50      # Less frequent logging
+    log_interval: int = 50    
     
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -69,8 +74,8 @@ class TrainConfig:
             f"pooling must be 'cls', 'mean', or 'max', got {self.pooling}"
         assert self.pos_encoding in ["absolute", "rope"], \
             f"pos_encoding must be 'absolute' or 'rope', got {self.pos_encoding}"
-        assert self.scheduler in ["cosine_plateau", "cosine_only"], \
-            f"scheduler must be 'cosine_plateau' or 'cosine_only', got {self.scheduler}"
+        assert self.scheduler in ["cosine_plateau", "cosine_only", "cosine_restarts"], \
+            f"scheduler must be 'cosine_plateau', 'cosine_only' or 'cosine_restarts', got {self.scheduler}"
         assert 0 < self.sampling_pct <= 1, \
             f"sampling_pct must be between 0 and 1, got {self.sampling_pct}"
         assert 0 < self.epoch_sampling_pct <= 1, \

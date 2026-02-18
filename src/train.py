@@ -242,7 +242,9 @@ def train(
     use_ema: bool = True,
     ema_decay: float = 0.999,
     validate_every: int = 1,
-    scheduler_type: str = "cosine_plateau"
+    scheduler_type: str = "cosine_plateau",
+    T_0: int = 10,
+    T_mult: int = 2
 ) -> Dict[str, List[float]]:
     """
     Full training loop with validation, early stopping, warmup, and mixed precision.
@@ -282,7 +284,43 @@ def train(
             progress = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
             return 0.01 + 0.99 * 0.5 * (1.0 + math.cos(math.pi * progress))
     
-    warmup_cosine_scheduler = optim.lr_scheduler.LambdaLR(optimizer, warmup_cosine_schedule_fn)
+    # Cosine Annealing with Warm Restarts
+    # This is implemented manually within the LambdaLR to handle the warmup phase seamlessly
+    def warmup_cosine_restarts_schedule_fn(current_step):
+        if current_step < warmup_steps:
+            # Linear warmup
+            return 0.1 + 0.9 * (current_step / warmup_steps)
+        else:
+            # Steps since warmup finished
+            steps_since_warmup = current_step - warmup_steps
+            
+            # Convert epochs to steps for cycle calculations
+            T_0_steps = T_0 * steps_per_epoch
+            
+            # Calculate which cycle we are in and the progress within that cycle
+            if T_mult == 1:
+                cycle_idx = steps_since_warmup // T_0_steps
+                cycle_progress = (steps_since_warmup % T_0_steps) / T_0_steps
+            else:
+                # Geometric series sum formula to find cycle index
+                # This is a bit complex to invert, so we can iterate to find the current cycle
+                # Given the number of epochs is usually small, a loop is fine or we can approximate
+                curr_cycle_steps = T_0_steps
+                total_steps_passed = 0
+                while steps_since_warmup >= total_steps_passed + curr_cycle_steps:
+                    total_steps_passed += curr_cycle_steps
+                    curr_cycle_steps *= T_mult
+                
+                cycle_progress = (steps_since_warmup - total_steps_passed) / curr_cycle_steps
+
+            return 0.01 + 0.99 * 0.5 * (1.0 + math.cos(math.pi * cycle_progress))
+
+    if scheduler_type == "cosine_restarts":
+        warmup_cosine_scheduler = optim.lr_scheduler.LambdaLR(optimizer, warmup_cosine_restarts_schedule_fn)
+        print(f"Scheduler: Warmup ({warmup_steps} steps) + Cosine Restarts (T_0={T_0} ep, T_mult={T_mult})")
+    else:
+        warmup_cosine_scheduler = optim.lr_scheduler.LambdaLR(optimizer, warmup_cosine_schedule_fn)
+        print(f"Scheduler: {warmup_steps} steps warmup + cosine annealing (total {total_steps} steps)")
     
     # Backup scheduler: ReduceLROnPlateau for when validation loss plateaus
     use_plateau = scheduler_type == "cosine_plateau"
@@ -295,8 +333,7 @@ def train(
             patience=plateau_patience,
             min_lr=1e-7
         )
-    
-    print(f"Scheduler: {warmup_steps} steps warmup + cosine annealing (total {total_steps} steps)")
+
     if use_plateau:
         print(f"Plateau LR reduction: factor={plateau_factor}, patience={plateau_patience}")
     else:
@@ -646,8 +683,14 @@ def main():
     parser.add_argument('--warmup_steps', type=int, default=cfg.warmup_steps,
                         help='Number of warmup steps')
     parser.add_argument('--scheduler', type=str, default=cfg.scheduler,
-                        choices=['cosine_plateau', 'cosine_only'],
-                        help='LR scheduler type: cosine_plateau (default) or cosine_only')
+                        choices=['cosine_plateau', 'cosine_only', 'cosine_restarts'],
+                        help='LR scheduler type: cosine_plateau (default), cosine_only or cosine_restarts')
+    parser.add_argument('--T_0', type=int, default=cfg.T_0,
+                        help='Number of epochs for the first restart cycle')
+    parser.add_argument('--T_mult', type=int, default=cfg.T_mult,
+                        help='Multiplier for cycle length after restarting')
+    parser.add_argument('--label_smoothing', type=float, default=cfg.label_smoothing,
+                        help='Label smoothing factor for CrossEntropyLoss (0.0 = disabled)')
     parser.add_argument('--weight_decay_transformer', type=float, default=cfg.weight_decay_transformer,
                         help='Weight decay for Transformer')
     parser.add_argument('--weight_decay_lstm', type=float, default=cfg.weight_decay_lstm,
@@ -818,7 +861,7 @@ def main():
         epochs=args.epochs,
         lr=lr,
         weight_decay=weight_decay,
-        save_dir=args.save_dir,
+        save_dir=args.save_dir if args.experiment_name == None else os.path.join(args.save_dir, args.experiment_name),
         patience=args.patience,
         use_amp=not args.no_amp,
         accumulation_steps=args.accumulation_steps,
@@ -833,7 +876,10 @@ def main():
         use_ema=not args.no_ema,
         ema_decay=cfg.ema_decay,
         validate_every=args.validate_every,
-        scheduler_type=args.scheduler
+        scheduler_type=args.scheduler,
+        T_0=args.T_0,
+        T_mult=args.T_mult,
+        label_smoothing=args.label_smoothing
     )
     
     # Log experiment results to CSV
