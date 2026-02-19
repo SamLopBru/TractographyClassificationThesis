@@ -57,6 +57,8 @@ class TrainConfig:
     max_grad_norm: float = 1.0  # Maximum gradient norm for clipping
     use_ema: bool = True        # Use Exponential Moving Average
     ema_decay: float = 0.999    # EMA decay factor
+    use_swa: bool = False       # Use Stochastic Weight Averaging (better generalization)
+    swa_start_epoch: int = 10   # Start averaging from this epoch
     validate_every: int = 2     # Validate every N epochs
     
     # Cosine Annealing with Warm Restarts configuration

@@ -19,6 +19,7 @@ from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import f1_score
 import torch.nn.functional as F
+from torch.optim.swa_utils import AveragedModel, update_bn
 
 
 class FocalLoss(nn.Module):
@@ -308,7 +309,9 @@ def train(
     T_0: int = 10,
     T_mult: int = 2,
     loss_type: str = "cross_entropy",
-    focal_gamma: float = 2.0
+    focal_gamma: float = 2.0,
+    use_swa: bool = False,
+    swa_start_epoch: int = 10
 ) -> Dict[str, List[float]]:
     """
     Full training loop with validation, early stopping, warmup, and mixed precision.
@@ -415,6 +418,13 @@ def train(
         for param in ema_model.parameters():
             param.requires_grad = False
         print(f"Using EMA with decay={ema_decay}")
+    
+    # SWA model for finding flatter minima (better generalization)
+    swa_model = None
+    swa_n = 0  # Number of models averaged so far
+    if use_swa:
+        swa_model = AveragedModel(model)
+        print(f"Using SWA starting from epoch {swa_start_epoch}")
     
     # Create save directory
     os.makedirs(save_dir, exist_ok=True)
@@ -577,8 +587,17 @@ def train(
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print(f"\n  Early stopping triggered after {epoch} epochs")
-                break
+                # If SWA is active, don't stop early — SWA needs continued training
+                if use_swa and epoch >= swa_start_epoch:
+                    print(f"  Patience exhausted but SWA is active — continuing training")
+                else:
+                    print(f"\n  Early stopping triggered after {epoch} epochs")
+                    break
+        
+        # Update SWA model after swa_start_epoch
+        if use_swa and swa_model is not None and epoch >= swa_start_epoch:
+            swa_model.update_parameters(model)
+            swa_n += 1
         
         # Save latest checkpoint with all states needed for resume
         torch.save({
@@ -598,6 +617,31 @@ def train(
         gc.collect()
         if device.type == 'cuda':
             torch.cuda.empty_cache()
+    
+    # Finalize SWA model
+    if use_swa and swa_model is not None and swa_n > 0:
+        print(f"\nFinalizing SWA model (averaged {swa_n} checkpoints)...")
+        print("Updating BatchNorm statistics with training data...")
+        update_bn(train_loader, swa_model, device=device)
+        
+        # Validate SWA model
+        swa_val_metrics = validate(swa_model, val_loader, criterion, device, use_amp=use_amp)
+        print(f"SWA Model Validation:")
+        print(f"  Val Loss: {swa_val_metrics['loss']:.4f}")
+        print(f"  Val Acc:  {swa_val_metrics['accuracy']:.2f}%")
+        print(f"  Val F1:   {swa_val_metrics['macro_f1']:.2f}%")
+        print(f"  Best Model F1 was: {best_val_f1:.2f}%")
+        
+        # Save SWA model
+        swa_save_path = os.path.join(save_dir, 'swa_model.pt')
+        torch.save({
+            'model_state_dict': swa_model.module.state_dict(),
+            'val_accuracy': swa_val_metrics['accuracy'],
+            'val_macro_f1': swa_val_metrics['macro_f1'],
+            'swa_n': swa_n,
+            'params': hparams
+        }, swa_save_path)
+        print(f"Saved SWA model to {swa_save_path}")
     
     # Save training history
     with open(os.path.join(save_dir, 'history.json'), 'w') as f:
@@ -768,6 +812,12 @@ def main():
                         help='Loss function: cross_entropy (default) or focal')
     parser.add_argument('--focal_gamma', type=float, default=cfg.focal_gamma,
                         help='Focal Loss gamma parameter (higher = more focus on hard examples)')
+    parser.add_argument('--use_swa', action='store_true', default=cfg.use_swa,
+                        help='Enable Stochastic Weight Averaging for better generalization')
+    parser.add_argument('--no_swa', action='store_true',
+                        help='Disable SWA (overrides --use_swa)')
+    parser.add_argument('--swa_start_epoch', type=int, default=cfg.swa_start_epoch,
+                        help='Epoch to start SWA averaging')
     
     # System arguments
     parser.add_argument('--num_workers', type=int, default=cfg.num_workers,
@@ -954,7 +1004,9 @@ def main():
         T_mult=args.T_mult,
         label_smoothing=args.label_smoothing,
         loss_type=args.loss,
-        focal_gamma=args.focal_gamma
+        focal_gamma=args.focal_gamma,
+        use_swa=args.use_swa and not args.no_swa,
+        swa_start_epoch=args.swa_start_epoch
     )
     
     # Log experiment results to CSV
