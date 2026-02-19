@@ -18,6 +18,68 @@ import csv
 from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import f1_score
+import torch.nn.functional as F
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for multi-class classification.
+    
+    Down-weights well-classified examples so the model focuses on hard,
+    misclassified examples. Useful when certain classes are inherently
+    harder to distinguish (e.g., overlapping bundles 24-27).
+    
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    
+    When gamma=0, this is equivalent to CrossEntropyLoss.
+    When gamma>0, easy examples (high p_t) get reduced loss.
+    
+    Reference: Lin et al., "Focal Loss for Dense Object Detection", ICCV 2017
+    """
+    
+    def __init__(self, gamma: float = 2.0, label_smoothing: float = 0.0, reduction: str = 'mean'):
+        """
+        Args:
+            gamma: Focusing parameter. Higher values put more focus on hard examples.
+                   gamma=0 is equivalent to CrossEntropyLoss. Typical values: 1.0-3.0.
+            label_smoothing: Label smoothing factor (0.0 = disabled).
+            reduction: 'mean', 'sum', or 'none'.
+        """
+        super().__init__()
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+        self.reduction = reduction
+    
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            logits: Raw model outputs of shape (N, C)
+            targets: Ground truth class indices of shape (N,)
+        Returns:
+            Focal loss value
+        """
+        # Compute standard cross-entropy (per sample, no reduction)
+        ce_loss = F.cross_entropy(
+            logits, targets, 
+            label_smoothing=self.label_smoothing, 
+            reduction='none'
+        )
+        
+        # Compute p_t (probability of the correct class)
+        log_probs = F.log_softmax(logits, dim=1)
+        probs = torch.exp(log_probs)
+        p_t = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        
+        # Apply focal modulation: (1 - p_t)^gamma
+        focal_weight = (1.0 - p_t) ** self.gamma
+        focal_loss = focal_weight * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
 
 # Enable cuDNN benchmarking for faster training (finds optimal algorithms for your hardware)
 torch.backends.cudnn.benchmark = True
@@ -244,7 +306,9 @@ def train(
     validate_every: int = 1,
     scheduler_type: str = "cosine_plateau",
     T_0: int = 10,
-    T_mult: int = 2
+    T_mult: int = 2,
+    loss_type: str = "cross_entropy",
+    focal_gamma: float = 2.0
 ) -> Dict[str, List[float]]:
     """
     Full training loop with validation, early stopping, warmup, and mixed precision.
@@ -263,9 +327,13 @@ def train(
     if use_amp:
         print("Using mixed precision (FP16) training")
     
-    # Loss function with label smoothing for better generalization
-    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-    print(f"Using CrossEntropyLoss with label_smoothing={label_smoothing}")
+    # Loss function selection
+    if loss_type == "focal":
+        criterion = FocalLoss(gamma=focal_gamma, label_smoothing=label_smoothing)
+        print(f"Using FocalLoss with gamma={focal_gamma}, label_smoothing={label_smoothing}")
+    else:
+        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        print(f"Using CrossEntropyLoss with label_smoothing={label_smoothing}")
     
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     
@@ -373,7 +441,7 @@ def train(
         # Load scheduler states if available
         if 'warmup_cosine_scheduler_state' in checkpoint:
             warmup_cosine_scheduler.load_state_dict(checkpoint['warmup_cosine_scheduler_state'])
-        if 'plateau_scheduler_state' in checkpoint:
+        if 'plateau_scheduler_state' in checkpoint and plateau_scheduler is not None:
             plateau_scheduler.load_state_dict(checkpoint['plateau_scheduler_state'])
         
         # Load scaler state if using AMP
@@ -695,6 +763,11 @@ def main():
                         help='Weight decay for Transformer')
     parser.add_argument('--weight_decay_lstm', type=float, default=cfg.weight_decay_lstm,
                         help='Weight decay for LSTM ')
+    parser.add_argument('--loss', type=str, default=cfg.loss_type,
+                        choices=['cross_entropy', 'focal'],
+                        help='Loss function: cross_entropy (default) or focal')
+    parser.add_argument('--focal_gamma', type=float, default=cfg.focal_gamma,
+                        help='Focal Loss gamma parameter (higher = more focus on hard examples)')
     
     # System arguments
     parser.add_argument('--num_workers', type=int, default=cfg.num_workers,
@@ -879,7 +952,9 @@ def main():
         scheduler_type=args.scheduler,
         T_0=args.T_0,
         T_mult=args.T_mult,
-        label_smoothing=args.label_smoothing
+        label_smoothing=args.label_smoothing,
+        loss_type=args.loss,
+        focal_gamma=args.focal_gamma
     )
     
     # Log experiment results to CSV
