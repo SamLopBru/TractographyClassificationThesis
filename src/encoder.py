@@ -5,6 +5,30 @@ import math
 from .positional_encodings import SinusoidalPositionalEncoding, RotaryPositionalEncoding
 
 
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization (Zhang & Sennrich, 2019).
+
+    Simpler and faster than LayerNorm — omits the mean centering step.
+    Used in LLaMA, Gemma, and other modern transformer architectures.
+    """
+
+    def __init__(self, d_model: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d_model))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x / rms * self.weight
+
+
+def _make_norm(norm_type: str, d_model: int) -> nn.Module:
+    """Factory to create the requested normalization layer."""
+    if norm_type == "rmsnorm":
+        return RMSNorm(d_model)
+    return nn.LayerNorm(d_model)
+
+
 
 class RoPETransformerEncoderLayer(nn.Module):
     """Transformer encoder layer with Rotary Positional Encoding.
@@ -22,7 +46,8 @@ class RoPETransformerEncoderLayer(nn.Module):
         nhead: int,
         dim_feedforward: int = 2048,
         dropout: float = 0.1,
-        max_len: int = 5000
+        max_len: int = 5000,
+        norm_type: str = "layernorm"
     ):
         super().__init__()
         assert d_model % nhead == 0, f"d_model ({d_model}) must be divisible by nhead ({nhead})"
@@ -49,9 +74,9 @@ class RoPETransformerEncoderLayer(nn.Module):
             nn.Dropout(dropout)
         )
         
-        # Layer norms (pre-norm)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
+        # Normalization layers (pre-norm)
+        self.norm1 = _make_norm(norm_type, d_model)
+        self.norm2 = _make_norm(norm_type, d_model)
         
         # Dropout for attention
         self.attn_dropout = nn.Dropout(dropout)
@@ -132,7 +157,8 @@ class TransformerEncoder(nn.Module):
         max_len: int = 5000,
         dropout: float = 0.1,
         pooling: str = 'cls',  # 'cls', 'mean', or 'max'
-        pos_encoding: str = 'absolute'  # 'absolute' or 'rope'
+        pos_encoding: str = 'absolute',  # 'absolute' or 'rope'
+        norm_layer: str = 'layernorm'  # 'layernorm' or 'rmsnorm'
     ):
         """
         Args:
@@ -145,12 +171,14 @@ class TransformerEncoder(nn.Module):
             max_len: Maximum sequence length for positional encoding
             dropout: Dropout rate
             pooling: Pooling strategy ('cls' for CLS token, 'mean' for mean pooling, 'max' for max pooling)
+            norm_layer: Normalization layer type ('layernorm' or 'rmsnorm')
         """
         super().__init__()
         
         self.d_model = d_model
         self.pooling = pooling
         self.pos_encoding = pos_encoding
+        self.norm_layer = norm_layer
         
         # Input projection: (batch, seq, 5) -> (batch, seq, d_model)
         self.input_projection = nn.Linear(input_size, d_model)
@@ -159,20 +187,22 @@ class TransformerEncoder(nn.Module):
         if pooling == 'cls':
             self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
         
-        if pos_encoding == 'rope':
-            # RoPE: positional info is injected inside each attention layer
-            self.pos_encoder = None
-            rope_layers = nn.ModuleList([
+        if pos_encoding == 'rope' or norm_layer == 'rmsnorm':
+            # Use custom encoder layers for RoPE and/or RMSNorm
+            # (nn.TransformerEncoderLayer only supports LayerNorm)
+            self.pos_encoder = None if pos_encoding == 'rope' else SinusoidalPositionalEncoding(d_model, max_len, dropout)
+            custom_layers = nn.ModuleList([
                 RoPETransformerEncoderLayer(
                     d_model=d_model,
                     nhead=nhead,
                     dim_feedforward=dim_feedforward,
                     dropout=dropout,
-                    max_len=max_len
+                    max_len=max_len,
+                    norm_type=norm_layer
                 )
                 for _ in range(num_layers)
             ])
-            self.transformer_encoder = rope_layers
+            self.transformer_encoder = custom_layers
         else:
             # Absolute sinusoidal positional encoding (default)
             self.pos_encoder = SinusoidalPositionalEncoding(d_model, max_len, dropout)
@@ -192,7 +222,7 @@ class TransformerEncoder(nn.Module):
         
         # Classification head
         self.classifier = nn.Sequential(
-            nn.LayerNorm(d_model),
+            _make_norm(norm_layer, d_model),
             nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -243,15 +273,19 @@ class TransformerEncoder(nn.Module):
                 cls_mask = torch.zeros(batch_size, 1, dtype=torch.bool, device=x.device)
                 padding_mask = torch.cat([cls_mask, padding_mask], dim=1)
         
-        if self.pos_encoding == 'rope':
-            # RoPE: no absolute PE, pass through custom RoPE layers
-            for layer in self.transformer_encoder:
-                x = layer(x, src_key_padding_mask=padding_mask)
-        else:
-            # Absolute PE
+        # Apply positional encoding if available (absolute PE)
+        if self.pos_encoder is not None:
             x = x.transpose(0, 1)
             x = self.pos_encoder(x)
             x = x.transpose(0, 1)
+        
+        # Pass through encoder layers
+        if isinstance(self.transformer_encoder, nn.ModuleList):
+            # Custom layers (RoPE and/or RMSNorm)
+            for layer in self.transformer_encoder:
+                x = layer(x, src_key_padding_mask=padding_mask)
+        else:
+            # Standard nn.TransformerEncoder
             x = self.transformer_encoder(x, src_key_padding_mask=padding_mask)
         
         # Pool the sequence
@@ -498,7 +532,7 @@ def create_encoder(
     if encoder_type == 'transformer':
         # Filter out LSTM-only kwargs
         valid_keys = {'input_size', 'd_model', 'nhead', 'num_layers', 'dim_feedforward',
-                      'max_len', 'dropout', 'pooling', 'pos_encoding'}
+                      'max_len', 'dropout', 'pooling', 'pos_encoding', 'norm_layer'}
         filtered = {k: v for k, v in kwargs.items() if k in valid_keys}
         return StreamlineEncoder(num_classes=num_classes, **filtered)
     elif encoder_type == 'lstm':

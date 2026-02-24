@@ -8,7 +8,7 @@ Optimized for RTX 5060 Ti (16GB VRAM).
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 
 @dataclass
@@ -22,7 +22,7 @@ class TrainConfig:
     epoch_sampling_pct: float = 0.05    # Percentage of indexed streamlines per epoch
     val_sampling_pct: float = 0.10      # Percentage of validation streamlines to use (higher = more stable metrics)
     min_samples_per_class: int = 10     # Minimum samples per class per epoch
-    full_sample_threshold: int = 1000   # If tract has fewer than this, take 100%
+    full_sample_threshold: Union[int, float] = 1000   # If tract has fewer than this, take 100%
     max_streamlines_per_tract: Optional[int] = None
     
     # Model configuration
@@ -36,6 +36,7 @@ class TrainConfig:
     dropout: float = 0.1
     pooling: str = "cls"       # "cls", "mean", or "max"
     pos_encoding: str = "absolute"  # "absolute" or "rope"
+    norm_layer: str = "layernorm"  # "layernorm" or "rmsnorm"
     
     # Training configuration
     epochs: int = 20            
@@ -78,6 +79,8 @@ class TrainConfig:
             f"pooling must be 'cls', 'mean', or 'max', got {self.pooling}"
         assert self.pos_encoding in ["absolute", "rope"], \
             f"pos_encoding must be 'absolute' or 'rope', got {self.pos_encoding}"
+        assert self.norm_layer in ["layernorm", "rmsnorm"], \
+            f"norm_layer must be 'layernorm' or 'rmsnorm', got {self.norm_layer}"
         assert self.scheduler in ["cosine_plateau", "cosine_only", "cosine_restarts"], \
             f"scheduler must be 'cosine_plateau', 'cosine_only' or 'cosine_restarts', got {self.scheduler}"
         assert self.loss_type in ["cross_entropy", "focal"], \

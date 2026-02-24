@@ -311,7 +311,8 @@ def train(
     loss_type: str = "cross_entropy",
     focal_gamma: float = 2.0,
     use_swa: bool = False,
-    swa_start_epoch: int = 10
+    swa_start_epoch: int = 10,
+    encoder_type: str = "transformer"
 ) -> Dict[str, List[float]]:
     """
     Full training loop with validation, early stopping, warmup, and mixed precision.
@@ -483,7 +484,16 @@ def train(
         'accumulation_steps': accumulation_steps,
         'use_ema': use_ema,
         'ema_decay': ema_decay,
-        'validate_every': validate_every
+        'validate_every': validate_every,
+        # Model architecture (needed by test.py to reconstruct the model)
+        'encoder_type': encoder_type,
+        'd_model': model.d_model if hasattr(model, 'd_model') else None,
+        'num_classes': num_classes,
+        'pooling': model.pooling if hasattr(model, 'pooling') else None,
+        'pos_encoding': model.pos_encoding if hasattr(model, 'pos_encoding') else None,
+        'norm_layer': model.norm_layer if hasattr(model, 'norm_layer') else 'layernorm',
+        'label_smoothing': label_smoothing,
+        'loss_type': loss_type,
     }
     writer.add_text('Hyperparameters', str(hparams), 0)
     
@@ -575,7 +585,8 @@ def train(
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_accuracy': val_metrics['accuracy'],
                 'val_macro_f1': best_val_f1,
-                'history': history
+                'history': history,
+                'params': hparams
             }
             torch.save(checkpoint, os.path.join(save_dir, 'best_model.pt'))
             
@@ -772,6 +783,8 @@ def main():
                         choices=['cls', 'mean', 'max', 'last'], help='Pooling strategy (last only for LSTM)')
     parser.add_argument('--pos_encoding', type=str, default=cfg.pos_encoding,
                         choices=['absolute', 'rope'], help='Positional encoding type (transformer only)')
+    parser.add_argument('--norm_layer', type=str, default=cfg.norm_layer,
+                        choices=['layernorm', 'rmsnorm'], help='Normalization layer type')
     
     # Training arguments
     parser.add_argument('--epochs', type=int, default=cfg.epochs,
@@ -917,7 +930,8 @@ def main():
             num_classes=args.num_classes,
             dropout=args.dropout,
             pooling=args.pooling,
-            pos_encoding=args.pos_encoding
+            pos_encoding=args.pos_encoding,
+            norm_layer=args.norm_layer
         )
     else:
         model = LSTMEncoder(
@@ -1006,7 +1020,8 @@ def main():
         loss_type=args.loss,
         focal_gamma=args.focal_gamma,
         use_swa=args.use_swa and not args.no_swa,
-        swa_start_epoch=args.swa_start_epoch
+        swa_start_epoch=args.swa_start_epoch,
+        encoder_type=args.encoder_type
     )
     
     # Log experiment results to CSV
