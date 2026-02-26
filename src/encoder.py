@@ -29,7 +29,6 @@ def _make_norm(norm_type: str, d_model: int) -> nn.Module:
     return nn.LayerNorm(d_model)
 
 
-
 class RoPETransformerEncoderLayer(nn.Module):
     """Transformer encoder layer with Rotary Positional Encoding.
     

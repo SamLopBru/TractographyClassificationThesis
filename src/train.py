@@ -22,66 +22,6 @@ import torch.nn.functional as F
 from torch.optim.swa_utils import AveragedModel, update_bn
 
 
-class FocalLoss(nn.Module):
-    """
-    Focal Loss for multi-class classification.
-    
-    Down-weights well-classified examples so the model focuses on hard,
-    misclassified examples. Useful when certain classes are inherently
-    harder to distinguish (e.g., overlapping bundles 24-27).
-    
-    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
-    
-    When gamma=0, this is equivalent to CrossEntropyLoss.
-    When gamma>0, easy examples (high p_t) get reduced loss.
-    
-    Reference: Lin et al., "Focal Loss for Dense Object Detection", ICCV 2017
-    """
-    
-    def __init__(self, gamma: float = 2.0, label_smoothing: float = 0.0, reduction: str = 'mean'):
-        """
-        Args:
-            gamma: Focusing parameter. Higher values put more focus on hard examples.
-                   gamma=0 is equivalent to CrossEntropyLoss. Typical values: 1.0-3.0.
-            label_smoothing: Label smoothing factor (0.0 = disabled).
-            reduction: 'mean', 'sum', or 'none'.
-        """
-        super().__init__()
-        self.gamma = gamma
-        self.label_smoothing = label_smoothing
-        self.reduction = reduction
-    
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            logits: Raw model outputs of shape (N, C)
-            targets: Ground truth class indices of shape (N,)
-        Returns:
-            Focal loss value
-        """
-        # Compute standard cross-entropy (per sample, no reduction)
-        ce_loss = F.cross_entropy(
-            logits, targets, 
-            label_smoothing=self.label_smoothing, 
-            reduction='none'
-        )
-        
-        # Compute p_t (probability of the correct class)
-        log_probs = F.log_softmax(logits, dim=1)
-        probs = torch.exp(log_probs)
-        p_t = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
-        
-        # Apply focal modulation: (1 - p_t)^gamma
-        focal_weight = (1.0 - p_t) ** self.gamma
-        focal_loss = focal_weight * ce_loss
-        
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        elif self.reduction == 'sum':
-            return focal_loss.sum()
-        else:
-            return focal_loss
-
 # Enable cuDNN benchmarking for faster training (finds optimal algorithms for your hardware)
 torch.backends.cudnn.benchmark = True
 
@@ -97,7 +37,8 @@ if torch.cuda.is_available():
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 
-from src.encoder import TransformerEncoder, LSTMEncoder
+from src.encoder import TransformerEncoder, LSTMEncoder, ProjectionHead
+from src.losses import FocalLoss, HybridSupConLoss
 from utils.dataloader import StreamlineDataset, StratifiedEpochSampler, EpochSubsetSampler, streamline_collate_fn
 from src.config import TrainConfig, DEFAULT_CONFIG
 
@@ -115,10 +56,14 @@ def train_epoch(
     log_interval: int = 100,
     scheduler: optim.lr_scheduler._LRScheduler = None,
     ema_model: nn.Module = None,
-    ema_decay: float = 0.999
+    ema_decay: float = 0.999,
+    projection_head: nn.Module = None
     ) -> Dict[str, float]:
     """Train for one epoch with optional mixed precision, gradient accumulation, and EMA."""
+    use_hybrid = projection_head is not None
     model.train()
+    if use_hybrid:
+        projection_head.train()
     # Initialize metrics as tensors to avoid CPU-GPU sync
     total_loss = torch.tensor(0.0, device=device)
     total_correct = torch.tensor(0.0, device=device)
@@ -138,14 +83,21 @@ def train_epoch(
         # Forward pass with optional mixed precision
         if use_amp and scaler is not None:
             with autocast(device_type='cuda', dtype=torch.float16):
-                logits = model(streamlines, lengths=lengths)
-                loss = criterion(logits, labels) / accumulation_steps
+                if use_hybrid:
+                    embeddings = model.get_embeddings(streamlines, lengths=lengths)
+                    logits = model.classifier(embeddings)
+                    projections = projection_head(embeddings)
+                    loss = criterion(logits, labels, projections) / accumulation_steps
+                else:
+                    logits = model(streamlines, lengths=lengths)
+                    loss = criterion(logits, labels) / accumulation_steps
             
             scaler.scale(loss).backward()
             
             if (batch_idx + 1) % accumulation_steps == 0:
                 scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                all_params = list(model.parameters()) + (list(projection_head.parameters()) if use_hybrid else [])
+                grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
                 
                 # Check for inf/nan gradients and skip if found
                 if torch.isfinite(grad_norm):
@@ -168,12 +120,19 @@ def train_epoch(
                         for ema_param, model_param in zip(ema_model.parameters(), model.parameters()):
                             ema_param.data.mul_(ema_decay).add_(model_param.data, alpha=1 - ema_decay)
         else:
-            logits = model(streamlines, lengths=lengths)
-            loss = criterion(logits, labels) / accumulation_steps
+            if use_hybrid:
+                embeddings = model.get_embeddings(streamlines, lengths=lengths)
+                logits = model.classifier(embeddings)
+                projections = projection_head(embeddings)
+                loss = criterion(logits, labels, projections) / accumulation_steps
+            else:
+                logits = model(streamlines, lengths=lengths)
+                loss = criterion(logits, labels) / accumulation_steps
             loss.backward()
             
             if (batch_idx + 1) % accumulation_steps == 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                all_params = list(model.parameters()) + (list(projection_head.parameters()) if use_hybrid else [])
+                grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
                 
                 # Check for inf/nan gradients and skip if found
                 if torch.isfinite(grad_norm):
@@ -312,7 +271,10 @@ def train(
     focal_gamma: float = 2.0,
     use_swa: bool = False,
     swa_start_epoch: int = 10,
-    encoder_type: str = "transformer"
+    encoder_type: str = "transformer",
+    supcon_weight: float = 0.1,
+    supcon_temperature: float = 0.07,
+    projection_dim: int = 128
 ) -> Dict[str, List[float]]:
     """
     Full training loop with validation, early stopping, warmup, and mixed precision.
@@ -332,14 +294,38 @@ def train(
         print("Using mixed precision (FP16) training")
     
     # Loss function selection
-    if loss_type == "focal":
+    projection_head = None
+    if loss_type == "supcon_hybrid":
+        # Build the base classification loss (CE with label smoothing)
+        base_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        criterion = HybridSupConLoss(
+            classification_loss=base_criterion,
+            supcon_weight=supcon_weight,
+            temperature=supcon_temperature
+        )
+        
+        # Create projection head for the contrastive branch
+        embedding_dim = model.d_model if hasattr(model, 'd_model') else model.hidden_size * 2
+        projection_head = ProjectionHead(
+            input_dim=embedding_dim,
+            hidden_dim=embedding_dim,
+            output_dim=projection_dim
+        ).to(device)
+        
+        print(f"Using HybridSupConLoss: CE(ls={label_smoothing}) + {supcon_weight}·SupCon(τ={supcon_temperature})")
+        print(f"Projection Head: {sum(p.numel() for p in projection_head.parameters()):,} params (train-time only)")
+    elif loss_type == "focal":
         criterion = FocalLoss(gamma=focal_gamma, label_smoothing=label_smoothing)
         print(f"Using FocalLoss with gamma={focal_gamma}, label_smoothing={label_smoothing}")
     else:
         criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
         print(f"Using CrossEntropyLoss with label_smoothing={label_smoothing}")
     
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # Optimizer — include projection head params if using hybrid loss
+    all_model_params = list(model.parameters())
+    if projection_head is not None:
+        all_model_params += list(projection_head.parameters())
+    optimizer = optim.AdamW(all_model_params, lr=lr, weight_decay=weight_decay)
     
     # Calculate total steps for warmup scheduling
     steps_per_epoch = len(train_loader)
@@ -518,7 +504,8 @@ def train(
             accumulation_steps=accumulation_steps,
             scheduler=warmup_cosine_scheduler,
             ema_model=ema_model,
-            ema_decay=ema_decay
+            ema_decay=ema_decay,
+            projection_head=projection_head
         )
         print(f"\n  Train Loss: {train_metrics['loss']:.4f} | Train Acc: {train_metrics['accuracy']:.2f}%")
         
@@ -821,10 +808,16 @@ def main():
     parser.add_argument('--weight_decay_lstm', type=float, default=cfg.weight_decay_lstm,
                         help='Weight decay for LSTM ')
     parser.add_argument('--loss', type=str, default=cfg.loss_type,
-                        choices=['cross_entropy', 'focal'],
-                        help='Loss function: cross_entropy (default) or focal')
+                        choices=['cross_entropy', 'focal', 'supcon_hybrid'],
+                        help='Loss function: cross_entropy (default), focal, or supcon_hybrid')
     parser.add_argument('--focal_gamma', type=float, default=cfg.focal_gamma,
                         help='Focal Loss gamma parameter (higher = more focus on hard examples)')
+    parser.add_argument('--supcon_weight', type=float, default=cfg.supcon_weight,
+                        help='Lambda weight for SupCon term in hybrid loss (default 0.1)')
+    parser.add_argument('--supcon_temperature', type=float, default=cfg.supcon_temperature,
+                        help='SupCon temperature (lower = sharper, default 0.07)')
+    parser.add_argument('--projection_dim', type=int, default=cfg.projection_dim,
+                        help='Projection head output dimension for SupCon (default 128)')
     parser.add_argument('--use_swa', action='store_true', default=cfg.use_swa,
                         help='Enable Stochastic Weight Averaging for better generalization')
     parser.add_argument('--no_swa', action='store_true',
@@ -1021,7 +1014,10 @@ def main():
         focal_gamma=args.focal_gamma,
         use_swa=args.use_swa and not args.no_swa,
         swa_start_epoch=args.swa_start_epoch,
-        encoder_type=args.encoder_type
+        encoder_type=args.encoder_type,
+        supcon_weight=args.supcon_weight,
+        supcon_temperature=args.supcon_temperature,
+        projection_dim=args.projection_dim
     )
     
     # Log experiment results to CSV
