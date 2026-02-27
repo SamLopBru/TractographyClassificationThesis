@@ -49,12 +49,6 @@ class TrainConfig:
     patience: int = 5           # Early Stop patience
     label_smoothing: float = 0.1  # Label smoothing for CrossEntropyLoss (0.0 = disabled)
     loss_type: str = "cross_entropy"  # "cross_entropy", "focal", or "supcon_hybrid"
-    focal_gamma: float = 2.0  # Focal Loss gamma (higher = more focus on hard examples)
-    
-    # Supervised Contrastive Loss (hybrid mode)
-    supcon_weight: float = 0.1        # Lambda weight for SupCon term in hybrid loss
-    supcon_temperature: float = 0.07  # SupCon temperature (lower = sharper)
-    projection_dim: int = 128         # Projection head output dimension
     use_amp: bool = True        # Activate Automatic Mixed Precision
     warmup_steps: int = 1500    # Warmup by steps 
     scheduler: str = "cosine_plateau"  # "cosine_plateau", "cosine_only" or "cosine_restarts"
@@ -67,6 +61,14 @@ class TrainConfig:
     swa_start_epoch: int = 10   # Start averaging from this epoch
     validate_every: int = 2     # Validate every N epochs
     
+    # Focal Loss configuration
+    focal_gamma: float = 2.0  # Focal Loss gamma (higher = more focus on hard examples)
+    
+    # Supervised Contrastive Loss (hybrid mode)
+    supcon_weight: float = 0.1        # Lambda weight for SupCon term in hybrid loss
+    supcon_temperature: float = 0.07  # SupCon temperature (lower = sharper)
+    projection_dim: int = 128         # Projection head output dimension
+
     # Cosine Annealing with Warm Restarts configuration
     T_0: int = 10               # Number of epochs for the first restart
     T_mult: int = 2             # Factor to increase the cycle length after each restart
@@ -88,8 +90,8 @@ class TrainConfig:
             f"norm_layer must be 'layernorm' or 'rmsnorm', got {self.norm_layer}"
         assert self.scheduler in ["cosine_plateau", "cosine_only", "cosine_restarts"], \
             f"scheduler must be 'cosine_plateau', 'cosine_only' or 'cosine_restarts', got {self.scheduler}"
-        assert self.loss_type in ["cross_entropy", "focal", "supcon_hybrid"], \
-            f"loss_type must be 'cross_entropy', 'focal', or 'supcon_hybrid', got {self.loss_type}"
+        assert self.loss_type in ["cross_entropy", "focal", "supcon_hybrid", "supcon_hybrid_focal"], \
+            f"loss_type must be 'cross_entropy', 'focal', 'supcon_hybrid', or 'supcon_hybrid_focal', got {self.loss_type}"
         assert 0 < self.sampling_pct <= 1, \
             f"sampling_pct must be between 0 and 1, got {self.sampling_pct}"
         assert 0 < self.epoch_sampling_pct <= 1, \

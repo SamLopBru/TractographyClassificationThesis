@@ -295,9 +295,14 @@ def train(
     
     # Loss function selection
     projection_head = None
-    if loss_type == "supcon_hybrid":
-        # Build the base classification loss (CE with label smoothing)
-        base_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    if loss_type in ("supcon_hybrid", "supcon_hybrid_focal"):
+        # Build the base classification loss
+        if loss_type == "supcon_hybrid_focal":
+            base_criterion = FocalLoss(gamma=focal_gamma, label_smoothing=label_smoothing)
+            base_name = f"Focal(γ={focal_gamma}, ls={label_smoothing})"
+        else:
+            base_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+            base_name = f"CE(ls={label_smoothing})"
         criterion = HybridSupConLoss(
             classification_loss=base_criterion,
             supcon_weight=supcon_weight,
@@ -312,7 +317,7 @@ def train(
             output_dim=projection_dim
         ).to(device)
         
-        print(f"Using HybridSupConLoss: CE(ls={label_smoothing}) + {supcon_weight}·SupCon(τ={supcon_temperature})")
+        print(f"Using HybridSupConLoss: {base_name} + {supcon_weight}·SupCon(τ={supcon_temperature})")
         print(f"Projection Head: {sum(p.numel() for p in projection_head.parameters()):,} params (train-time only)")
     elif loss_type == "focal":
         criterion = FocalLoss(gamma=focal_gamma, label_smoothing=label_smoothing)
@@ -808,8 +813,8 @@ def main():
     parser.add_argument('--weight_decay_lstm', type=float, default=cfg.weight_decay_lstm,
                         help='Weight decay for LSTM ')
     parser.add_argument('--loss', type=str, default=cfg.loss_type,
-                        choices=['cross_entropy', 'focal', 'supcon_hybrid'],
-                        help='Loss function: cross_entropy (default), focal, or supcon_hybrid')
+                        choices=['cross_entropy', 'focal', 'supcon_hybrid', 'supcon_hybrid_focal'],
+                        help='Loss function: cross_entropy (default), focal, supcon_hybrid, or supcon_hybrid_focal')
     parser.add_argument('--focal_gamma', type=float, default=cfg.focal_gamma,
                         help='Focal Loss gamma parameter (higher = more focus on hard examples)')
     parser.add_argument('--supcon_weight', type=float, default=cfg.supcon_weight,
