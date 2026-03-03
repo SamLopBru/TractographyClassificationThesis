@@ -1,8 +1,11 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from torch.amp import autocast, GradScaler
+from torch.optim.swa_utils import AveragedModel, update_bn
 from pathlib import Path
 import os
 import sys
@@ -12,17 +15,20 @@ from typing import Dict, List, Tuple, Optional
 import json
 import math
 import gc
-import copy
 import numpy as np
 import csv
 from datetime import datetime
-from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import f1_score
-import torch.nn.functional as F
-from torch.optim.swa_utils import AveragedModel, update_bn
+from contextlib import nullcontext
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
+from src.encoder import TransformerEncoder, LSTMEncoder
+from src.losses import FocalLoss, HybridSupConLoss, ProjectionHead, SupConLoss, _make_loss
+from utils.dataloader import StreamlineDataset, StratifiedEpochSampler, EpochSubsetSampler, streamline_collate_fn
+from src.config import TrainConfig, DEFAULT_CONFIG
 
 
-# Enable cuDNN benchmarking for faster training (finds optimal algorithms for your hardware)
+# Enable cuDNN benchmarking for faster training (finds optimal algorithms for hardware)
 torch.backends.cudnn.benchmark = True
 
 # Enable TensorFloat-32 for faster matmul on Ampere+ GPUs (RTX 30xx, 40xx, 50xx)
@@ -34,13 +40,6 @@ torch.manual_seed(SEED)
 np.random.seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
-
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
-
-from src.encoder import TransformerEncoder, LSTMEncoder, ProjectionHead
-from src.losses import FocalLoss, HybridSupConLoss
-from utils.dataloader import StreamlineDataset, StratifiedEpochSampler, EpochSubsetSampler, streamline_collate_fn
-from src.config import TrainConfig, DEFAULT_CONFIG
 
 
 def train_epoch(
@@ -55,15 +54,14 @@ def train_epoch(
     accumulation_steps: int = 1,
     log_interval: int = 100,
     scheduler: optim.lr_scheduler._LRScheduler = None,
-    ema_model: nn.Module = None,
-    ema_decay: float = 0.999,
     projection_head: nn.Module = None
     ) -> Dict[str, float]:
-    """Train for one epoch with optional mixed precision, gradient accumulation, and EMA."""
+    """Train for one epoch with optional mixed precision and gradient accumulation."""
     use_hybrid = projection_head is not None
     model.train()
     if use_hybrid:
         projection_head.train()
+
     # Initialize metrics as tensors to avoid CPU-GPU sync
     total_loss = torch.tensor(0.0, device=device)
     total_correct = torch.tensor(0.0, device=device)
@@ -81,45 +79,8 @@ def train_epoch(
         labels = labels.to(device, non_blocking=True)
         
         # Forward pass with optional mixed precision
-        if use_amp and scaler is not None:
-            with autocast(device_type='cuda', dtype=torch.float16):
-                if use_hybrid:
-                    embeddings = model.get_embeddings(streamlines, lengths=lengths)
-                    logits = model.classifier(embeddings)
-                    projections = projection_head(embeddings)
-                    loss = criterion(logits, labels, projections) / accumulation_steps
-                else:
-                    logits = model(streamlines, lengths=lengths)
-                    loss = criterion(logits, labels) / accumulation_steps
-            
-            scaler.scale(loss).backward()
-            
-            if (batch_idx + 1) % accumulation_steps == 0:
-                scaler.unscale_(optimizer)
-                all_params = list(model.parameters()) + (list(projection_head.parameters()) if use_hybrid else [])
-                grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
-                
-                # Check for inf/nan gradients and skip if found
-                if torch.isfinite(grad_norm):
-                    total_grad_norm += grad_norm.item()
-                    grad_norm_count += 1
-                    scaler.step(optimizer)
-                else:
-                    print(f"  ⚠ Warning: Skipping batch {batch_idx+1} due to inf/nan gradients")
-                
-                scaler.update()
-                optimizer.zero_grad()
-                
-                # Step-based LR scheduler update
-                if scheduler is not None:
-                    scheduler.step()
-                
-                # EMA update
-                if ema_model is not None:
-                    with torch.no_grad():
-                        for ema_param, model_param in zip(ema_model.parameters(), model.parameters()):
-                            ema_param.data.mul_(ema_decay).add_(model_param.data, alpha=1 - ema_decay)
-        else:
+        amp_ctx = autocast(device_type='cuda', dtype=torch.float16) if use_amp else nullcontext()
+        with amp_ctx:
             if use_hybrid:
                 embeddings = model.get_embeddings(streamlines, lengths=lengths)
                 logits = model.classifier(embeddings)
@@ -128,31 +89,38 @@ def train_epoch(
             else:
                 logits = model(streamlines, lengths=lengths)
                 loss = criterion(logits, labels) / accumulation_steps
+        
+        # Backward pass
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
             loss.backward()
+        
+        # Gradient step
+        if (batch_idx + 1) % accumulation_steps == 0:
+            if scaler is not None:
+                scaler.unscale_(optimizer)
             
-            if (batch_idx + 1) % accumulation_steps == 0:
-                all_params = list(model.parameters()) + (list(projection_head.parameters()) if use_hybrid else [])
-                grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
-                
-                # Check for inf/nan gradients and skip if found
-                if torch.isfinite(grad_norm):
-                    total_grad_norm += grad_norm.item()
-                    grad_norm_count += 1
-                    optimizer.step()
+            all_params = list(model.parameters()) + (list(projection_head.parameters()) if use_hybrid else [])
+            grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+            
+            if torch.isfinite(grad_norm):
+                total_grad_norm += grad_norm.item()
+                grad_norm_count += 1
+                if scaler is not None:
+                    scaler.step(optimizer)
                 else:
-                    print(f"  ⚠ Warning: Skipping batch {batch_idx+1} due to inf/nan gradients")
-                
-                optimizer.zero_grad()
-                
-                # Step-based LR scheduler update
-                if scheduler is not None:
-                    scheduler.step()
-                
-                # EMA update
-                if ema_model is not None:
-                    with torch.no_grad():
-                        for ema_param, model_param in zip(ema_model.parameters(), model.parameters()):
-                            ema_param.data.mul_(ema_decay).add_(model_param.data, alpha=1 - ema_decay)
+                    optimizer.step()
+            else:
+                print(f"  ⚠ Warning: Skipping batch {batch_idx+1} due to inf/nan gradients")
+            
+            if scaler is not None:
+                scaler.update()
+            optimizer.zero_grad()
+            
+            # Step-based LR scheduler update
+            if scheduler is not None:
+                scheduler.step()
         
         # Metrics (accumulate tensors to avoid sync)
         with torch.no_grad():
@@ -161,8 +129,7 @@ def train_epoch(
             total_correct += (predictions == labels).sum()
             total_samples += labels.size(0)
         
-        if (batch_idx + 1) % log_interval == 0:
-            # Sync only for logging
+        if (batch_idx + 1) % log_interval == 0:  # Sync only for logging
             avg_loss = total_loss.item() / total_samples
             accuracy = 100.0 * total_correct.item() / total_samples
             elapsed = time.time() - start_time
@@ -172,15 +139,24 @@ def train_epoch(
     
     # Handle any remaining gradients
     if (batch_idx + 1) % accumulation_steps != 0:
-        if use_amp and scaler is not None:
+        if scaler is not None:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
+        
+        all_params = list(model.parameters()) + (list(projection_head.parameters()) if use_hybrid else [])
+        grad_norm = torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+        
+        if torch.isfinite(grad_norm):
+            if scaler is not None:
+                scaler.step(optimizer)
+            else:
+                optimizer.step()
+        
+        if scaler is not None:
             scaler.update()
-        else:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
         optimizer.zero_grad()
+        
+        if scheduler is not None:
+            scheduler.step()
     
     return {
         'loss': total_loss.item() / total_samples,
@@ -213,11 +189,8 @@ def validate(
         lengths = lengths.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         
-        if use_amp:
-            with autocast(device_type='cuda', dtype=torch.float16):
-                logits = model(streamlines, lengths=lengths)
-                loss = criterion(logits, labels)
-        else:
+        amp_ctx = autocast(device_type='cuda', dtype=torch.float16) if use_amp else nullcontext()
+        with amp_ctx:
             logits = model(streamlines, lengths=lengths)
             loss = criterion(logits, labels)
         
@@ -229,14 +202,11 @@ def validate(
         # Collect for F1 computation
         all_labels.extend(labels.cpu().numpy())
         all_preds.extend(predictions.cpu().numpy())
-    
-    # Compute Macro F1 (treats all classes equally)
-    macro_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0) * 100
-    
+ 
     return {
         'loss': total_loss / total_samples,
         'accuracy': 100.0 * total_correct / total_samples,
-        'macro_f1': macro_f1
+        'macro_f1': f1_score(all_labels, all_preds, average='macro', zero_division=0) * 100, # Compute Macro F1 (treats all classes equally)
     }
 
 
@@ -261,8 +231,6 @@ def train(
     num_classes: int = 32,
     label_smoothing: float = 0.1,
     resume_checkpoint: str = None,
-    use_ema: bool = True,
-    ema_decay: float = 0.999,
     validate_every: int = 1,
     scheduler_type: str = "cosine_plateau",
     T_0: int = 10,
@@ -282,11 +250,15 @@ def train(
     Features:
     - LR warmup by steps (not epochs) for consistent warmup across batch sizes
     - Cosine annealing after warmup with ReduceLROnPlateau as backup
-    - EMA (Exponential Moving Average) for better final model quality
     - Validation scheduling (less frequent during early training)
     - Label smoothing for better generalization
     """
     model = model.to(device)
+    
+    # Disable AMP on non-CUDA devices
+    if use_amp and device.type != 'cuda':
+        print("⚠ AMP disabled (requires CUDA device)")
+        use_amp = False
     
     # Mixed precision scaler
     scaler = GradScaler() if use_amp else None
@@ -295,36 +267,24 @@ def train(
     
     # Loss function selection
     projection_head = None
-    if loss_type in ("supcon_hybrid", "supcon_hybrid_focal"):
-        # Build the base classification loss
-        if loss_type == "supcon_hybrid_focal":
-            base_criterion = FocalLoss(gamma=focal_gamma, label_smoothing=label_smoothing)
-            base_name = f"Focal(γ={focal_gamma}, ls={label_smoothing})"
-        else:
-            base_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-            base_name = f"CE(ls={label_smoothing})"
-        criterion = HybridSupConLoss(
-            classification_loss=base_criterion,
-            supcon_weight=supcon_weight,
-            temperature=supcon_temperature
-        )
-        
-        # Create projection head for the contrastive branch
+    criterion = _make_loss(
+        loss_name=loss_type,
+        label_smoothing=label_smoothing,
+        focal_gamma=focal_gamma,
+        supcon_weight=supcon_weight,
+        supcon_temperature=supcon_temperature
+    )
+    print(f"Using {criterion.__class__.__name__} (loss_type='{loss_type}')")
+    
+    # Create projection head if using a hybrid/contrastive loss
+    if isinstance(criterion, (HybridSupConLoss, SupConLoss)):
         embedding_dim = model.d_model if hasattr(model, 'd_model') else model.hidden_size * 2
         projection_head = ProjectionHead(
             input_dim=embedding_dim,
             hidden_dim=embedding_dim,
             output_dim=projection_dim
         ).to(device)
-        
-        print(f"Using HybridSupConLoss: {base_name} + {supcon_weight}·SupCon(τ={supcon_temperature})")
         print(f"Projection Head: {sum(p.numel() for p in projection_head.parameters()):,} params (train-time only)")
-    elif loss_type == "focal":
-        criterion = FocalLoss(gamma=focal_gamma, label_smoothing=label_smoothing)
-        print(f"Using FocalLoss with gamma={focal_gamma}, label_smoothing={label_smoothing}")
-    else:
-        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-        print(f"Using CrossEntropyLoss with label_smoothing={label_smoothing}")
     
     # Optimizer — include projection head params if using hybrid loss
     all_model_params = list(model.parameters())
@@ -402,15 +362,7 @@ def train(
     else:
         print(f"Pure cosine annealing (no plateau fallback)")
     
-    # EMA model for better final quality
-    ema_model = None
-    if use_ema:
-        ema_model = copy.deepcopy(model)
-        ema_model.eval()
-        for param in ema_model.parameters():
-            param.requires_grad = False
-        print(f"Using EMA with decay={ema_decay}")
-    
+
     # SWA model for finding flatter minima (better generalization)
     swa_model = None
     swa_n = 0  # Number of models averaged so far
@@ -473,8 +425,6 @@ def train(
         'plateau_patience': plateau_patience,
         'plateau_factor': plateau_factor,
         'accumulation_steps': accumulation_steps,
-        'use_ema': use_ema,
-        'ema_decay': ema_decay,
         'validate_every': validate_every,
         # Model architecture (needed by test.py to reconstruct the model)
         'encoder_type': encoder_type,
@@ -508,8 +458,6 @@ def train(
             scaler=scaler, use_amp=use_amp,
             accumulation_steps=accumulation_steps,
             scheduler=warmup_cosine_scheduler,
-            ema_model=ema_model,
-            ema_decay=ema_decay,
             projection_head=projection_head
         )
         print(f"\n  Train Loss: {train_metrics['loss']:.4f} | Train Acc: {train_metrics['accuracy']:.2f}%")
@@ -526,11 +474,7 @@ def train(
             # Validate with regular model
             val_metrics = validate(model, val_loader, criterion, device, use_amp=use_amp)
             
-            # If using EMA, also validate with EMA model and report
-            if ema_model is not None:
-                ema_val_metrics = validate(ema_model, val_loader, criterion, device, use_amp=use_amp)
-                print(f"  [EMA] Val Loss: {ema_val_metrics['loss']:.4f} | Val Acc: {ema_val_metrics['accuracy']:.2f}% | Val F1: {ema_val_metrics['macro_f1']:.2f}%")
-            
+
             # Plateau scheduler uses val loss (only if enabled)
             if plateau_scheduler is not None:
                 plateau_scheduler.step(val_metrics['loss'])
@@ -573,7 +517,6 @@ def train(
             checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
-                'ema_model_state_dict': ema_model.state_dict() if ema_model is not None else None,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_accuracy': val_metrics['accuracy'],
                 'val_macro_f1': best_val_f1,
@@ -581,11 +524,6 @@ def train(
                 'params': hparams
             }
             torch.save(checkpoint, os.path.join(save_dir, 'best_model.pt'))
-            
-            # Also save EMA model separately if available
-            if ema_model is not None:
-                torch.save({'model_state_dict': ema_model.state_dict()}, 
-                          os.path.join(save_dir, 'best_model_ema.pt'))
             print(f"  ✓ Saved new best model (Val F1: {best_val_f1:.2f}%, Acc: {val_metrics['accuracy']:.2f}%)")
         else:
             patience_counter += 1
@@ -606,7 +544,6 @@ def train(
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
-            'ema_model_state_dict': ema_model.state_dict() if ema_model is not None else None,
             'optimizer_state_dict': optimizer.state_dict(),
             'warmup_cosine_scheduler_state': warmup_cosine_scheduler.state_dict(),
             'plateau_scheduler_state': plateau_scheduler.state_dict() if plateau_scheduler is not None else None,
@@ -793,8 +730,7 @@ def main():
                         help='Early stopping patience')
     parser.add_argument('--no_amp', action='store_true',
                         help='Disable mixed precision')
-    parser.add_argument('--no_ema', action='store_true',
-                        help='Disable Exponential Moving Average')
+
     parser.add_argument('--validate_every', type=int, default=cfg.validate_every,
                         help='Validate every N epochs')
     parser.add_argument('--warmup_steps', type=int, default=cfg.warmup_steps,
@@ -813,8 +749,8 @@ def main():
     parser.add_argument('--weight_decay_lstm', type=float, default=cfg.weight_decay_lstm,
                         help='Weight decay for LSTM ')
     parser.add_argument('--loss', type=str, default=cfg.loss_type,
-                        choices=['cross_entropy', 'focal', 'supcon_hybrid', 'supcon_hybrid_focal'],
-                        help='Loss function: cross_entropy (default), focal, supcon_hybrid, or supcon_hybrid_focal')
+                        choices=['ce', 'focal', 'hybrid_supcon_ce', 'hybrid_supcon_focal'],
+                        help='Loss function: ce (default), focal, hybrid_supcon_ce, or hybrid_supcon_focal')
     parser.add_argument('--focal_gamma', type=float, default=cfg.focal_gamma,
                         help='Focal Loss gamma parameter (higher = more focus on hard examples)')
     parser.add_argument('--supcon_weight', type=float, default=cfg.supcon_weight,
@@ -1008,8 +944,7 @@ def main():
         train_dataset=train_dataset,
         num_classes=args.num_classes,
         resume_checkpoint=args.resume,
-        use_ema=not args.no_ema,
-        ema_decay=cfg.ema_decay,
+
         validate_every=args.validate_every,
         scheduler_type=args.scheduler,
         T_0=args.T_0,
@@ -1051,7 +986,7 @@ def main():
             'plateau_patience': cfg.plateau_patience,
             'plateau_factor': cfg.plateau_factor,
             'weight_decay': weight_decay,
-            'use_ema': not args.no_ema,
+
             'pretrained': args.pretrained_encoder is not None,
             'pos_encoding': args.pos_encoding,
             'sampling_pct': args.sampling_pct,
@@ -1076,8 +1011,8 @@ python src/train.py --encoder_type lstm
 # Train with larger batch size and more epochs
 python src/train.py --batch_size 512 --epochs 100
 
-# Train with custom data directory
-python src/train.py --data_dir /path/to/your/hdf5/files
+# Train with custom data directories
+python src/train.py --train_dir /path/to/train/hdf5 --val_dir /path/to/val/hdf5
 
 # Disable mixed precision (if you have GPU issues)
 python src/train.py --no_amp

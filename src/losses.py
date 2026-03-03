@@ -2,10 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-
-
-
 class FocalLoss(nn.Module):
     """
     Focal Loss for multi-class classification.
@@ -140,6 +136,38 @@ class SupConLoss(nn.Module):
         return loss
 
 
+class ProjectionHead(nn.Module):
+    """
+    MLP projection head for contrastive learning.
+    
+    Projects encoder embeddings into a lower-dimensional, L2-normalized space
+    where contrastive loss is computed. Only used during contrastive pre-training.
+    
+    Architecture: Linear → BatchNorm → ReLU → Linear → L2-normalize
+    Reference: "Supervised Contrastive Learning" (Khosla et al., 2020)
+    """
+    
+    def __init__(self, input_dim: int, hidden_dim: int = 256, output_dim: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, output_dim)
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Embeddings of shape (batch_size, input_dim)
+        
+        Returns:
+            L2-normalized projections of shape (batch_size, output_dim)
+        """
+        projected = self.net(x)
+        return F.normalize(projected, dim=1)
+
+
 class HybridSupConLoss(nn.Module):
     """
     Hybrid Classification + Supervised Contrastive Loss.
@@ -190,10 +218,54 @@ class HybridSupConLoss(nn.Module):
         Returns:
             Scalar loss value
         """
-        ce_loss = self.classification_loss(logits, labels)
+        classification_loss = self.classification_loss(logits, labels)
         
         if projections is not None:
             sc_loss = self.supcon_loss(projections, labels)
-            return ce_loss + self.supcon_weight * sc_loss
+            return classification_loss + self.supcon_weight * sc_loss
         
-        return ce_loss
+        return classification_loss
+
+
+def _make_loss(
+    loss_name: str,
+    label_smoothing: float = 0.0,
+    focal_gamma: float = 2.0,
+    supcon_weight: float = 0.1,
+    supcon_temperature: float = 0.07
+    ) -> nn.Module:
+    """
+    Factory function for creating loss modules.
+    
+    Args:
+        loss_name: One of 'ce', 'focal', 'supcon', 'hybrid_supcon_ce', 'hybrid_supcon_focal'
+        label_smoothing: Label smoothing factor (for CE and Focal)
+        focal_gamma: Focusing parameter for FocalLoss
+        supcon_weight: Weight of the SupCon term in hybrid losses
+        supcon_temperature: Temperature for SupCon similarity scaling
+    """
+    parts = loss_name.split("_")
+    
+    if parts[0] == "supcon":
+        return SupConLoss(temperature=supcon_temperature)
+    elif parts[0] == "focal":
+        return FocalLoss(gamma=focal_gamma, label_smoothing=label_smoothing)
+    elif parts[0] == "ce":
+        return nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    elif parts[0] == "hybrid":
+        if len(parts) == 3 and parts[1] == "supcon":
+            if parts[2] == "ce":
+                base = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+            elif parts[2] == "focal":
+                base = FocalLoss(gamma=focal_gamma, label_smoothing=label_smoothing)
+            else:
+                raise ValueError(f"Unknown loss name: {loss_name}")
+            return HybridSupConLoss(
+                classification_loss=base,
+                supcon_weight=supcon_weight,
+                temperature=supcon_temperature
+            )
+        else:
+            raise ValueError(f"Unknown loss name: {loss_name}")
+    else:
+        raise ValueError(f"Unknown loss name: {loss_name}")

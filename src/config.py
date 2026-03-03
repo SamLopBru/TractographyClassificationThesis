@@ -48,15 +48,13 @@ class TrainConfig:
     accumulation_steps: int = 2
     patience: int = 5           # Early Stop patience
     label_smoothing: float = 0.1  # Label smoothing for CrossEntropyLoss (0.0 = disabled)
-    loss_type: str = "cross_entropy"  # "cross_entropy", "focal", or "supcon_hybrid"
+    loss_type: str = "ce"  # "ce", "focal", "supcon", "hybrid_supcon_ce", or "hybrid_supcon_focal"
     use_amp: bool = True        # Activate Automatic Mixed Precision
     warmup_steps: int = 1500    # Warmup by steps 
     scheduler: str = "cosine_plateau"  # "cosine_plateau", "cosine_only" or "cosine_restarts"
     plateau_patience: int = 5   # Epochs before LR reduction on plateau
     plateau_factor: float = 0.5 # LR reduction factor on plateau
     max_grad_norm: float = 1.0  # Maximum gradient norm for clipping
-    use_ema: bool = True        # Use Exponential Moving Average
-    ema_decay: float = 0.999    # EMA decay factor
     use_swa: bool = False       # Use Stochastic Weight Averaging (better generalization)
     swa_start_epoch: int = 10   # Start averaging from this epoch
     validate_every: int = 2     # Validate every N epochs
@@ -90,8 +88,8 @@ class TrainConfig:
             f"norm_layer must be 'layernorm' or 'rmsnorm', got {self.norm_layer}"
         assert self.scheduler in ["cosine_plateau", "cosine_only", "cosine_restarts"], \
             f"scheduler must be 'cosine_plateau', 'cosine_only' or 'cosine_restarts', got {self.scheduler}"
-        assert self.loss_type in ["cross_entropy", "focal", "supcon_hybrid", "supcon_hybrid_focal"], \
-            f"loss_type must be 'cross_entropy', 'focal', 'supcon_hybrid', or 'supcon_hybrid_focal', got {self.loss_type}"
+        assert self.loss_type in ["ce", "focal", "hybrid_supcon_ce", "hybrid_supcon_focal"], \
+            f"loss_type must be 'ce', 'focal', 'hybrid_supcon_ce', or 'hybrid_supcon_focal', got {self.loss_type}"
         assert 0 < self.sampling_pct <= 1, \
             f"sampling_pct must be between 0 and 1, got {self.sampling_pct}"
         assert 0 < self.epoch_sampling_pct <= 1, \

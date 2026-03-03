@@ -478,39 +478,6 @@ class LSTMEncoder(nn.Module):
         logits = self.classifier(pooled)
         return logits
 
-
-class ProjectionHead(nn.Module):
-    """
-    MLP projection head for contrastive learning.
-    
-    Projects encoder embeddings into a lower-dimensional, L2-normalized space
-    where contrastive loss is computed. Only used during contrastive pre-training.
-    
-    Architecture: Linear → BatchNorm → ReLU → Linear → L2-normalize
-    Reference: "Supervised Contrastive Learning" (Khosla et al., 2020)
-    """
-    
-    def __init__(self, input_dim: int, hidden_dim: int = 256, output_dim: int = 128):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, output_dim)
-        )
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Embeddings of shape (batch_size, input_dim)
-        
-        Returns:
-            L2-normalized projections of shape (batch_size, output_dim)
-        """
-        projected = self.net(x)
-        return F.normalize(projected, dim=1)
-
-
 # Convenience factory function
 def create_encoder(
     encoder_type: str = 'transformer',

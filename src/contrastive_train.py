@@ -41,85 +41,11 @@ from typing import Dict, List
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.encoder import StreamlineEncoder, LightweightStreamlineEncoder, ProjectionHead
+from src.encoder import StreamlineEncoder, LightweightStreamlineEncoder
+from src.losses import ProjectionHead, SupConLoss
 from src.dataloader import StreamlineDataset, StratifiedEpochSampler, streamline_collate_fn
 from src.config import TrainConfig, DEFAULT_CONFIG
 
-
-class SupConLoss(nn.Module):
-    """
-    Supervised Contrastive Loss (SupCon).
-    
-    Pulls together embeddings of samples from the same class and pushes apart
-    embeddings of samples from different classes in a temperature-scaled 
-    cosine similarity space.
-    
-    Reference: "Supervised Contrastive Learning" (Khosla et al., 2020)
-    
-    Args:
-        temperature: Temperature scaling factor (lower = sharper distribution)
-    """
-    
-    def __init__(self, temperature: float = 0.07):
-        super().__init__()
-        self.temperature = temperature
-    
-    def forward(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        """
-        Compute SupCon loss.
-        
-        Args:
-            features: L2-normalized embeddings of shape (batch_size, projection_dim)
-            labels: Class labels of shape (batch_size,)
-        
-        Returns:
-            Scalar loss value
-        """
-        device = features.device
-        batch_size = features.shape[0]
-        
-        # Compute pairwise cosine similarity (features are already L2-normalized)
-        # sim_matrix[i, j] = cos_sim(features[i], features[j]) / temperature
-        sim_matrix = torch.matmul(features, features.T) / self.temperature
-        
-        # Create mask for positive pairs (same class, excluding self)
-        labels = labels.unsqueeze(1)
-        positive_mask = (labels == labels.T).float()  # (batch, batch)
-        
-        # Remove self-similarity from the diagonal
-        self_mask = torch.eye(batch_size, device=device)
-        positive_mask = positive_mask - self_mask
-        
-        # Number of positives per sample
-        num_positives = positive_mask.sum(dim=1)  # (batch,)
-        
-        # For numerical stability, subtract max from sim_matrix
-        sim_max, _ = sim_matrix.max(dim=1, keepdim=True)
-        sim_matrix = sim_matrix - sim_max.detach()
-        
-        # Compute log-sum-exp of all pairs (excluding self)
-        # exp_sim[i, j] = exp(sim(i, j) / temperature) for j != i
-        exp_sim = torch.exp(sim_matrix) * (1 - self_mask)
-        log_sum_exp = torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-12)
-        
-        # Compute log-probability of positive pairs
-        # log_prob[i, j] = sim(i, j) / temperature - log(sum_k exp(sim(i, k) / temperature))
-        log_prob = sim_matrix - log_sum_exp
-        
-        # Average log-probability over positive pairs
-        # Only consider samples that have at least one positive pair
-        has_positives = num_positives > 0
-        
-        if has_positives.sum() == 0:
-            return torch.tensor(0.0, device=device, requires_grad=True)
-        
-        # Mean of log-probabilities of positive pairs for each anchor
-        mean_log_prob = (positive_mask * log_prob).sum(dim=1) / num_positives.clamp(min=1)
-        
-        # Loss is negative mean log-probability (averaged over valid anchors)
-        loss = -mean_log_prob[has_positives].mean()
-        
-        return loss
 
 
 def compute_contrastive_metrics(features: torch.Tensor, labels: torch.Tensor) -> Dict[str, float]:
