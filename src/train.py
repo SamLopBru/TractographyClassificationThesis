@@ -433,6 +433,7 @@ def train(
         'pooling': model.pooling if hasattr(model, 'pooling') else None,
         'pos_encoding': model.pos_encoding if hasattr(model, 'pos_encoding') else None,
         'norm_layer': model.norm_layer if hasattr(model, 'norm_layer') else 'layernorm',
+        'deep_classifier': getattr(model, 'deep_classifier', False),
         'label_smoothing': label_smoothing,
         'loss_type': loss_type,
     }
@@ -714,6 +715,8 @@ def main():
                         choices=['absolute', 'rope'], help='Positional encoding type (transformer only)')
     parser.add_argument('--norm_layer', type=str, default=cfg.norm_layer,
                         choices=['layernorm', 'rmsnorm'], help='Normalization layer type')
+    parser.add_argument('--deep_classifier', action='store_true', default=cfg.deep_classifier,
+                        help='Use deeper 2-hidden-layer classifier head (d→2d→d→C)')
     
     # Training arguments
     parser.add_argument('--epochs', type=int, default=cfg.epochs,
@@ -865,7 +868,8 @@ def main():
             dropout=args.dropout,
             pooling=args.pooling,
             pos_encoding=args.pos_encoding,
-            norm_layer=args.norm_layer
+            norm_layer=args.norm_layer,
+            deep_classifier=args.deep_classifier
         )
     else:
         model = LSTMEncoder(

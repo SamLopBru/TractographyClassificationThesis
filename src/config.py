@@ -37,6 +37,7 @@ class TrainConfig:
     pooling: str = "cls"       # "cls", "mean", or "max"
     pos_encoding: str = "absolute"  # "absolute" or "rope"
     norm_layer: str = "layernorm"  # "layernorm" or "rmsnorm"
+    deep_classifier: bool = False  # Use deeper 2-hidden-layer classifier head
     
     # Training configuration
     epochs: int = 20            

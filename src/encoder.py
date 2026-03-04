@@ -157,7 +157,8 @@ class TransformerEncoder(nn.Module):
         dropout: float = 0.1,
         pooling: str = 'cls',  # 'cls', 'mean', or 'max'
         pos_encoding: str = 'absolute',  # 'absolute' or 'rope'
-        norm_layer: str = 'layernorm'  # 'layernorm' or 'rmsnorm'
+        norm_layer: str = 'layernorm',  # 'layernorm' or 'rmsnorm'
+        deep_classifier: bool = False  # Use deeper 2-hidden-layer classifier head
     ):
         """
         Args:
@@ -178,6 +179,7 @@ class TransformerEncoder(nn.Module):
         self.pooling = pooling
         self.pos_encoding = pos_encoding
         self.norm_layer = norm_layer
+        self.deep_classifier = deep_classifier
         
         # Input projection: (batch, seq, 5) -> (batch, seq, d_model)
         self.input_projection = nn.Linear(input_size, d_model)
@@ -220,13 +222,25 @@ class TransformerEncoder(nn.Module):
             )
         
         # Classification head
-        self.classifier = nn.Sequential(
-            _make_norm(norm_layer, d_model),
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, num_classes)
-        )
+        if deep_classifier:
+            self.classifier = nn.Sequential(
+                _make_norm(norm_layer, d_model),
+                nn.Linear(d_model, d_model * 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_model * 2, d_model),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_model, num_classes)
+            )
+        else:
+            self.classifier = nn.Sequential(
+                _make_norm(norm_layer, d_model),
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_model, num_classes)
+            )
         
         self._init_weights()
     
@@ -498,7 +512,7 @@ def create_encoder(
     if encoder_type == 'transformer':
         # Filter out LSTM-only kwargs
         valid_keys = {'input_size', 'd_model', 'nhead', 'num_layers', 'dim_feedforward',
-                      'max_len', 'dropout', 'pooling', 'pos_encoding', 'norm_layer'}
+                      'max_len', 'dropout', 'pooling', 'pos_encoding', 'norm_layer', 'deep_classifier'}
         filtered = {k: v for k, v in kwargs.items() if k in valid_keys}
         return StreamlineEncoder(num_classes=num_classes, **filtered)
     elif encoder_type == 'lstm':

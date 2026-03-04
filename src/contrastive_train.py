@@ -34,16 +34,29 @@ import math
 import argparse
 import copy
 import gc
+import numpy as np
 from datetime import datetime
 import json
 import csv
 from typing import Dict, List
 
+# Enable cuDNN benchmarking for faster training
+torch.backends.cudnn.benchmark = True
+# Enable TensorFloat-32 for faster matmul on Ampere+ GPUs
+torch.set_float32_matmul_precision('high')
+
+# Fix random seeds for reproducibility
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.encoder import StreamlineEncoder, LightweightStreamlineEncoder
-from src.losses import ProjectionHead, SupConLoss
-from src.dataloader import StreamlineDataset, StratifiedEpochSampler, streamline_collate_fn
+from src.encoder import TransformerEncoder, LSTMEncoder
+from src.losses import SupConLoss, ProjectionHead
+from utils.dataloader import StreamlineDataset, StratifiedEpochSampler, streamline_collate_fn
 from src.config import TrainConfig, DEFAULT_CONFIG
 
 
@@ -281,7 +294,10 @@ def contrastive_train(
     use_ema: bool = True,
     ema_decay: float = 0.999,
     validate_every: int = 2,
-    log_interval: int = 50
+    log_interval: int = 50,
+    scheduler_type: str = "cosine_only",
+    T_0: int = 10,
+    T_mult: int = 2
 ) -> Dict[str, List[float]]:
     """
     Full contrastive pre-training loop.
@@ -316,9 +332,29 @@ def contrastive_train(
             progress = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
             return 0.01 + 0.99 * 0.5 * (1.0 + math.cos(math.pi * progress))
     
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, warmup_cosine_fn)
+    def warmup_cosine_restarts_fn(current_step):
+        if current_step < warmup_steps:
+            return 0.1 + 0.9 * (current_step / warmup_steps)
+        else:
+            steps_since_warmup = current_step - warmup_steps
+            T_0_steps = T_0 * steps_per_epoch
+            if T_mult == 1:
+                cycle_progress = (steps_since_warmup % T_0_steps) / T_0_steps
+            else:
+                curr_cycle_steps = T_0_steps
+                total_steps_passed = 0
+                while steps_since_warmup >= total_steps_passed + curr_cycle_steps:
+                    total_steps_passed += curr_cycle_steps
+                    curr_cycle_steps *= T_mult
+                cycle_progress = (steps_since_warmup - total_steps_passed) / curr_cycle_steps
+            return 0.01 + 0.99 * 0.5 * (1.0 + math.cos(math.pi * cycle_progress))
     
-    print(f"Scheduler: {warmup_steps} steps warmup + cosine annealing (total {total_steps} steps)")
+    if scheduler_type == "cosine_restarts":
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, warmup_cosine_restarts_fn)
+        print(f"Scheduler: Warmup ({warmup_steps} steps) + Cosine Restarts (T_0={T_0} ep, T_mult={T_mult})")
+    else:
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, warmup_cosine_fn)
+        print(f"Scheduler: {warmup_steps} steps warmup + cosine annealing (total {total_steps} steps)")
     
     # EMA encoder (no projection head in EMA — we only save the encoder)
     ema_encoder = None
@@ -557,6 +593,10 @@ def main():
                         choices=['cls', 'mean', 'max', 'last'])
     parser.add_argument('--pos_encoding', type=str, default=cfg.pos_encoding,
                         choices=['absolute', 'rope'], help='Positional encoding type (transformer only)')
+    parser.add_argument('--norm_layer', type=str, default=cfg.norm_layer,
+                        choices=['layernorm', 'rmsnorm'], help='Normalization layer type')
+    parser.add_argument('--deep_classifier', action='store_true', default=cfg.deep_classifier,
+                        help='Use deeper 2-hidden-layer classifier head')
     
     # Contrastive-specific arguments
     parser.add_argument('--temperature', type=float, default=0.07,
@@ -565,6 +605,8 @@ def main():
                         help='Projection head output dimension')
     
     # Training arguments
+    parser.add_argument('--experiment_name', type=str, default=None,
+                        help='Name/description of this experiment')
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--batch_size', type=int, default=cfg.batch_size)
     parser.add_argument('--base_lr', type=float, default=cfg.base_lr)
@@ -575,6 +617,13 @@ def main():
     parser.add_argument('--no_ema', action='store_true')
     parser.add_argument('--validate_every', type=int, default=cfg.validate_every)
     parser.add_argument('--warmup_steps', type=int, default=cfg.warmup_steps)
+    parser.add_argument('--scheduler', type=str, default='cosine_only',
+                        choices=['cosine_only', 'cosine_restarts'],
+                        help='LR scheduler type')
+    parser.add_argument('--T_0', type=int, default=cfg.T_0,
+                        help='Cosine restarts: epochs for first cycle')
+    parser.add_argument('--T_mult', type=int, default=cfg.T_mult,
+                        help='Cosine restarts: cycle length multiplier')
     
     # System arguments
     parser.add_argument('--num_workers', type=int, default=cfg.num_workers)
@@ -585,11 +634,6 @@ def main():
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    
-    # Enable TF32 for faster matmul on Ampere+ GPUs
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
     
     # Load data
     train_dir = Path(args.train_dir)
@@ -649,7 +693,7 @@ def main():
     
     # Create encoder (without classifier — we only use get_embeddings())
     if args.encoder_type == 'transformer':
-        encoder = StreamlineEncoder(
+        encoder = TransformerEncoder(
             input_size=cfg.input_size,
             d_model=args.d_model,
             nhead=args.nhead,
@@ -658,11 +702,13 @@ def main():
             num_classes=cfg.num_classes,  # Required by __init__, but classifier won't be used
             dropout=args.dropout,
             pooling=args.pooling,
-            pos_encoding=args.pos_encoding
+            pos_encoding=args.pos_encoding,
+            norm_layer=args.norm_layer,
+            deep_classifier=args.deep_classifier
         )
         embedding_dim = args.d_model
     else:
-        encoder = LightweightStreamlineEncoder(
+        encoder = LSTMEncoder(
             input_size=cfg.input_size,
             hidden_size=args.d_model,
             num_layers=args.num_layers,
@@ -702,6 +748,11 @@ def main():
     # Weight decay
     weight_decay = cfg.weight_decay_transformer if args.encoder_type == 'transformer' else cfg.weight_decay_lstm
     
+    # Save dir with experiment name
+    save_dir = args.save_dir
+    if args.experiment_name:
+        save_dir = os.path.join('checkpoints', args.experiment_name)
+    
     # Train
     history = contrastive_train(
         encoder=encoder,
@@ -713,7 +764,7 @@ def main():
         lr=lr,
         weight_decay=weight_decay,
         temperature=args.temperature,
-        save_dir=args.save_dir,
+        save_dir=save_dir,
         patience=args.patience,
         use_amp=not args.no_amp,
         accumulation_steps=args.accumulation_steps,
@@ -723,12 +774,16 @@ def main():
         use_ema=not args.no_ema,
         ema_decay=cfg.ema_decay,
         validate_every=args.validate_every,
-        log_interval=args.log_interval
+        log_interval=args.log_interval,
+        scheduler_type=args.scheduler,
+        T_0=args.T_0,
+        T_mult=args.T_mult
     )
 
     # Log experiment results to CSV
+    experiment_name = args.experiment_name or f"{args.encoder_type}_d{args.d_model}_L{args.num_layers}_t{args.temperature}"
     log_contrastive_experiment(
-        experiment_name=f"{args.encoder_type}_d{args.d_model}_L{args.num_layers}_t{args.temperature}",
+        experiment_name=experiment_name,
         encoder_type=args.encoder_type,
         history=history,
         params={
