@@ -2,7 +2,7 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from pathlib import Path
-from typing import List, Tuple, Optional, Iterator
+from typing import List, Tuple, Optional, Iterator, Union
 import h5py
 import numpy as np  
 
@@ -95,7 +95,7 @@ class StratifiedEpochSampler(Sampler[int]):
         dataset: 'StreamlineDataset',
         sampling_percentage: float = 0.10,
         min_samples_per_class: int = 10,
-        full_sample_threshold: int = 1000,
+        full_sample_threshold: Union[int, float, None] = 1000,
         seed: int = 42,
         shuffle: bool = True
     ):
@@ -104,7 +104,10 @@ class StratifiedEpochSampler(Sampler[int]):
             dataset: StreamlineDataset with streamline_index containing 'tract_id'
             sampling_percentage: Percentage to sample from EACH class (0-1)
             min_samples_per_class: Minimum samples per class per epoch
-            full_sample_threshold: If class has fewer than this many indexed, take all (100%)
+            full_sample_threshold: Threshold below which a class is fully sampled.
+                - int: absolute count (e.g. 1000 → classes with <1000 samples are fully used)
+                - float (0-1): percentage of largest class (e.g. 0.05 → 5% of max class size)
+                - None: no minimum threshold (only sampling_percentage applies)
             seed: Base random seed for reproducibility
             shuffle: Whether to shuffle the final indices
         """
@@ -137,11 +140,16 @@ class StratifiedEpochSampler(Sampler[int]):
                     self.class_indices[tract_id] = []
                 self.class_indices[tract_id].append(idx)
         
-        # Adaptive threshold: 5% of the largest class size
+        # Compute the full-sample threshold
         max_class_size = max(len(indices) for indices in self.class_indices.values())
-        adaptive_threshold = int(max_class_size * 0.05)
-        if self.full_sample_threshold is not None:
-            adaptive_threshold = max(adaptive_threshold, self.full_sample_threshold)
+        if self.full_sample_threshold is None:
+            adaptive_threshold = 0  # No threshold, always apply sampling_percentage
+        elif isinstance(self.full_sample_threshold, float) and self.full_sample_threshold < 1.0:
+            # Percentage of largest class (e.g. 0.05 → 5% of max class)
+            adaptive_threshold = int(max_class_size * self.full_sample_threshold)
+        else:
+            # Absolute scalar (e.g. 1000)
+            adaptive_threshold = int(self.full_sample_threshold)
         
         # Calculate samples per class
         self.samples_per_class = {}
@@ -160,9 +168,17 @@ class StratifiedEpochSampler(Sampler[int]):
         
         self.n_samples = total_samples
         
+        # Descriptive label for the threshold mode
+        if self.full_sample_threshold is None:
+            threshold_desc = "no threshold"
+        elif isinstance(self.full_sample_threshold, float) and self.full_sample_threshold < 1.0:
+            threshold_desc = f"{self.full_sample_threshold*100:.0f}% of max class={max_class_size}"
+        else:
+            threshold_desc = f"fixed={int(self.full_sample_threshold)}"
+        
         print(f"StratifiedEpochSampler: {self.n_samples} samples per epoch "
               f"({self.sampling_percentage*100:.1f}% per class, full if <{adaptive_threshold} "
-              f"[5% of max class={max_class_size}])")
+              f"[{threshold_desc}])")
         # for tract_id in sorted(self.samples_per_class.keys()):
         #     print(f"  Class {tract_id}: {self.samples_per_class[tract_id]} / {len(self.class_indices[tract_id])}")
     
@@ -222,7 +238,7 @@ class StreamlineDataset(Dataset):
         sampling_percentage: float = 0.10,
         min_streamlines: int = 50,
         max_streamlines_per_tract: int = None,
-        full_sample_threshold: int = 1000,
+        full_sample_threshold: Union[int, float, None] = 1000,
         seed: int = 42,
         cache_dir: str = None,
     ):
@@ -232,7 +248,10 @@ class StreamlineDataset(Dataset):
             sampling_percentage: Percentage of streamlines to index from each tract (0-1)
             min_streamlines: Minimum number of streamlines per tract
             max_streamlines_per_tract: Maximum number of streamlines per tract (None = no limit)
-            full_sample_threshold: If tract has fewer than this many streamlines, take all (100%)
+            full_sample_threshold: Threshold below which a tract is fully sampled.
+                - int: absolute count (e.g. 1000)
+                - float (0-1): percentage of largest bundle (e.g. 0.05)
+                - None: no minimum threshold
             seed: Random seed for reproducibility of the initial sampling
             cache_dir: Optional directory to cache the index (for faster startup)
         """
@@ -280,13 +299,16 @@ class StreamlineDataset(Dataset):
                     all_tract_sizes.append(n_available)
                     tract_metadata.append((file_path, group_name, file_id, group_id, tract_id, n_available))
         
-        # Adaptive threshold: 5% of the largest bundle
+        # Compute the full-sample threshold
         max_bundle_size = max(all_tract_sizes) if all_tract_sizes else 1000
-        adaptive_threshold = int(max_bundle_size * 0.05)
-        if self.full_sample_threshold is not None:
-            adaptive_threshold = max(adaptive_threshold, self.full_sample_threshold)
-        print(f"  Adaptive full-sample threshold: {adaptive_threshold} "
-              f"(5% of max bundle={max_bundle_size})")
+        if self.full_sample_threshold is None:
+            adaptive_threshold = 0
+        elif isinstance(self.full_sample_threshold, float) and self.full_sample_threshold < 1.0:
+            adaptive_threshold = int(max_bundle_size * self.full_sample_threshold)
+        else:
+            adaptive_threshold = int(self.full_sample_threshold)
+        print(f"  Full-sample threshold: {adaptive_threshold} "
+              f"(max bundle={max_bundle_size})")
         
         # Second pass: sample streamlines using the adaptive threshold
         index_entries = []

@@ -42,8 +42,8 @@ from sklearn.preprocessing import label_binarize
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.encoder import StreamlineEncoder, LightweightStreamlineEncoder
-from src.dataloader import StreamlineDataset, streamline_collate_fn
+from src.encoder import TransformerEncoder, LSTMEncoder
+from utils.dataloader import StreamlineDataset, streamline_collate_fn
 from src.config import TrainConfig, DEFAULT_CONFIG
 
 
@@ -52,13 +52,32 @@ def load_model(
     config: TrainConfig,
     device: torch.device
 ) -> nn.Module:
-    """Load a trained model from checkpoint."""
+    """Load a trained model from checkpoint.
+    
+    Reads the saved 'params' dict from the checkpoint to reconstruct
+    the exact model architecture used during training, falling back
+    to the provided config for any missing keys.
+    """
     
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
+    # Override config with params saved in the checkpoint (if available)
+    saved_params = checkpoint.get('params', {})
+    if saved_params:
+        print(f"Loading model config from checkpoint params")
+        for key in ['encoder_type', 'd_model', 'nhead', 'num_layers', 
+                    'dim_feedforward', 'num_classes', 'dropout', 
+                    'pooling', 'pos_encoding', 'input_size', 'norm_layer',
+                    'deep_classifier']:
+            if key in saved_params:
+                setattr(config, key, saved_params[key])
+                print(f"  {key}: {saved_params[key]}")
+    else:
+        print("WARNING: No 'params' found in checkpoint, using default config")
+    
     # Create model based on config
     if config.encoder_type == 'transformer':
-        model = StreamlineEncoder(
+        model = TransformerEncoder(
             input_size=config.input_size,
             d_model=config.d_model,
             nhead=config.nhead,
@@ -66,11 +85,13 @@ def load_model(
             dim_feedforward=config.dim_feedforward,
             num_classes=config.num_classes,
             dropout=config.dropout,
-            pooling="cls",
-            pos_encoding=config.pos_encoding
+            pooling=config.pooling,
+            pos_encoding=config.pos_encoding,
+            norm_layer=getattr(config, 'norm_layer', 'layernorm'),
+            deep_classifier=getattr(config, 'deep_classifier', False)
         )
     else:
-        model = LightweightStreamlineEncoder(
+        model = LSTMEncoder(
             input_size=config.input_size,
             hidden_size=config.d_model,
             num_layers=config.num_layers,
@@ -88,6 +109,8 @@ def load_model(
     print(f"Loaded model from epoch {checkpoint.get('epoch', 'unknown')}")
     if 'val_accuracy' in checkpoint:
         print(f"Checkpoint validation accuracy: {checkpoint['val_accuracy']:.2f}%")
+    if 'val_macro_f1' in checkpoint:
+        print(f"Checkpoint validation F1: {checkpoint['val_macro_f1']:.2f}%")
     
     return model, checkpoint
 
@@ -168,7 +191,7 @@ def compute_metrics(
     metrics['recall_per_class'] = recall_score(labels, preds, average=None, zero_division=0) * 100
     metrics['f1_per_class'] = f1_score(labels, preds, average=None, zero_division=0) * 100
     
-    # Top-k accuracy (if more than 2 classes)
+    # Top-k accuracy
     if num_classes > 2:
         for k in [3, 5]:
             if k <= num_classes:
@@ -474,7 +497,7 @@ def main():
                         help='Path to model checkpoint')
     parser.add_argument('--output_dir', type=str, default='tests/test_results',
                         help='Directory to save results')
-    parser.add_argument('--batch_size', type=int, default=cfg.batch_size,
+    parser.add_argument('--batch_size', type=int, default=4096,
                         help='Batch size for inference')
     parser.add_argument('--num_workers', type=int, default=cfg.num_workers,
                         help='DataLoader workers')
@@ -522,7 +545,7 @@ def main():
     # Create dataloader
     test_loader = DataLoader(
         test_dataset,
-        batch_size=4096,
+        batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
