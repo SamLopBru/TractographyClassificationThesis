@@ -32,7 +32,7 @@ import sys
 import time
 import math
 import argparse
-import copy
+
 import gc
 import numpy as np
 from datetime import datetime
@@ -115,9 +115,7 @@ def contrastive_train_epoch(
     use_amp: bool = True,
     accumulation_steps: int = 1,
     log_interval: int = 50,
-    scheduler: optim.lr_scheduler._LRScheduler = None,
-    ema_encoder: nn.Module = None,
-    ema_decay: float = 0.999
+    scheduler: optim.lr_scheduler._LRScheduler = None
 ) -> Dict[str, float]:
     """Train encoder + projection head for one epoch with SupCon loss."""
     encoder.train()
@@ -161,12 +159,6 @@ def contrastive_train_epoch(
                 
                 if scheduler is not None:
                     scheduler.step()
-                
-                # EMA update for encoder only
-                if ema_encoder is not None:
-                    with torch.no_grad():
-                        for ema_p, model_p in zip(ema_encoder.parameters(), encoder.parameters()):
-                            ema_p.data.mul_(ema_decay).add_(model_p.data, alpha=1 - ema_decay)
         else:
             embeddings = encoder.get_embeddings(streamlines, lengths=lengths)
             projections = projection_head(embeddings)
@@ -188,11 +180,6 @@ def contrastive_train_epoch(
                 
                 if scheduler is not None:
                     scheduler.step()
-                
-                if ema_encoder is not None:
-                    with torch.no_grad():
-                        for ema_p, model_p in zip(ema_encoder.parameters(), encoder.parameters()):
-                            ema_p.data.mul_(ema_decay).add_(model_p.data, alpha=1 - ema_decay)
         
         # Metrics accumulation
         with torch.no_grad():
@@ -291,8 +278,6 @@ def contrastive_train(
     train_sampler: StratifiedEpochSampler = None,
     val_sampler: StratifiedEpochSampler = None,
     warmup_steps: int = 500,
-    use_ema: bool = True,
-    ema_decay: float = 0.999,
     validate_every: int = 2,
     log_interval: int = 50,
     scheduler_type: str = "cosine_only",
@@ -356,14 +341,7 @@ def contrastive_train(
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, warmup_cosine_fn)
         print(f"Scheduler: {warmup_steps} steps warmup + cosine annealing (total {total_steps} steps)")
     
-    # EMA encoder (no projection head in EMA — we only save the encoder)
-    ema_encoder = None
-    if use_ema:
-        ema_encoder = copy.deepcopy(encoder)
-        ema_encoder.eval()
-        for p in ema_encoder.parameters():
-            p.requires_grad = False
-        print(f"Using EMA with decay={ema_decay}")
+
     
     # Create save directory
     os.makedirs(save_dir, exist_ok=True)
@@ -399,9 +377,7 @@ def contrastive_train(
             scaler=scaler, use_amp=use_amp,
             accumulation_steps=accumulation_steps,
             log_interval=log_interval,
-            scheduler=scheduler,
-            ema_encoder=ema_encoder,
-            ema_decay=ema_decay
+            scheduler=scheduler
         )
         
         print(f"\n  Train Loss: {train_metrics['loss']:.4f}")
@@ -418,13 +394,6 @@ def contrastive_train(
             val_metrics = contrastive_validate(
                 encoder, projection_head, val_loader, criterion, device, use_amp
             )
-            
-            # Also validate EMA encoder
-            if ema_encoder is not None:
-                ema_val = contrastive_validate(
-                    ema_encoder, projection_head, val_loader, criterion, device, use_amp
-                )
-                print(f"  [EMA] Val Loss: {ema_val['loss']:.4f}")
         else:
             val_metrics = {'loss': history['val_loss'][-1] if history['val_loss'] else float('inf'),
                           'alignment': 0, 'uniformity': 0}
@@ -467,16 +436,6 @@ def contrastive_train(
                 'temperature': temperature,
                 'history': history
             }, os.path.join(save_dir, 'pretrained_encoder.pt'))
-            
-            # Also save EMA encoder if available
-            if ema_encoder is not None:
-                ema_state = ema_encoder.state_dict()
-                ema_state = {k.replace('_orig_mod.', ''): v for k, v in ema_state.items()}
-                torch.save({
-                    'encoder_state_dict': ema_state,
-                    'epoch': epoch,
-                    'val_loss': best_val_loss,
-                }, os.path.join(save_dir, 'pretrained_encoder_ema.pt'))
             
             print(f"  ✓ Saved best pre-trained encoder (Val Loss: {best_val_loss:.4f})")
         else:
@@ -614,7 +573,6 @@ def main():
     parser.add_argument('--accumulation_steps', type=int, default=cfg.accumulation_steps)
     parser.add_argument('--patience', type=int, default=10)
     parser.add_argument('--no_amp', action='store_true')
-    parser.add_argument('--no_ema', action='store_true')
     parser.add_argument('--validate_every', type=int, default=cfg.validate_every)
     parser.add_argument('--warmup_steps', type=int, default=cfg.warmup_steps)
     parser.add_argument('--scheduler', type=str, default='cosine_only',
@@ -771,8 +729,6 @@ def main():
         train_sampler=train_sampler,
         val_sampler=val_sampler,
         warmup_steps=args.warmup_steps,
-        use_ema=not args.no_ema,
-        ema_decay=cfg.ema_decay,
         validate_every=args.validate_every,
         log_interval=args.log_interval,
         scheduler_type=args.scheduler,
