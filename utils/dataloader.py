@@ -141,7 +141,7 @@ class StratifiedEpochSampler(Sampler[int]):
         max_class_size = max(len(indices) for indices in self.class_indices.values())
         adaptive_threshold = int(max_class_size * 0.05)
         if self.full_sample_threshold is not None:
-            adaptive_threshold = max(adaptive_threshold, self.full_sample_threshold)
+            adaptive_threshold = min(adaptive_threshold, self.full_sample_threshold)
         
         # Calculate samples per class
         self.samples_per_class = {}
@@ -284,7 +284,7 @@ class StreamlineDataset(Dataset):
         max_bundle_size = max(all_tract_sizes) if all_tract_sizes else 1000
         adaptive_threshold = int(max_bundle_size * 0.05)
         if self.full_sample_threshold is not None:
-            adaptive_threshold = max(adaptive_threshold, self.full_sample_threshold)
+            adaptive_threshold = min(adaptive_threshold, self.full_sample_threshold)
         print(f"  Adaptive full-sample threshold: {adaptive_threshold} "
               f"(5% of max bundle={max_bundle_size})")
         
@@ -433,4 +433,29 @@ def streamline_collate_fn(batch: List[Tuple[torch.Tensor, int, int]]) -> Tuple[t
     padded_streamlines = pad_sequence(streamlines, batch_first=True, padding_value=0.0)
     
     return padded_streamlines, lengths, labels
+
+
+
+
+# import h5py
+# from collections import defaultdict
+# from pathlib import Path
+
+# train_dir = Path("sequences/trainset")
+# train_files = sorted([str(f) for f in train_dir.glob("*.hdf5")])
+
+# total_per_bundle = defaultdict(int)
+
+# for fpath in train_files:
+#     with h5py.File(fpath, "r") as f:
+#         for group_name in f.keys():
+#             if not group_name.startswith("tract_"):
+#                 continue
+#             tract_id = int(f[group_name].attrs["tract_id"])
+#             n = int(f[group_name].attrs["n_streamlines"])
+#             total_per_bundle[tract_id] += n
+
+# # Sort by number of streamlines (descending)
+# for bid, n in sorted(total_per_bundle.items(), key=lambda kv: kv[1], reverse=True):
+#     print(f"  Bundle {bid}: {n:,} streamlines")
 

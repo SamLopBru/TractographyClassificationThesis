@@ -1,2 +1,7 @@
 timestamp,experiment,encoder_type,best_val_loss,best_epoch,total_epochs,final_train_loss,final_val_loss,final_alignment,best_alignment,final_uniformity,best_uniformity,mean_epoch_time,d_model,num_layers,nhead,temperature,projection_dim,lr,batch_size,accumulation_steps,dropout,pooling,warmup_steps,sampling_pct,epoch_sampling_pct,parameters
 2026-03-05 01:32:38,contrastive_pretrain_base_config,transformer,6.9777,14,29,4.2402,6.9923,0.0000,0.0000,0.0000,-0.0266,236.0,256,6,8,0.07,128,0.000282842712474619,1024,2,0.1,cls,1500,0.1,0.05,3238944
+2026-03-07 05:45:53,contrastive_pretrain_base_config_min,transformer,6.9777,14,29,4.2402,6.9923,0.0000,0.0000,0.0000,-0.0266,236.2,256,6,8,0.07,128,0.000282842712474619,1024,2,0.1,cls,1500,0.1,0.05,3238944
+2026-03-10 08:41:19,contrastive_temp_0.1,transformer,6.9771,6,21,4.2613,6.9853,0.0000,0.0000,0.0000,-0.0354,237.0,256,6,8,0.1,128,0.000282842712474619,1024,2,0.1,cls,1500,0.1,0.05,3238944
+2026-03-10 10:06:49,contrastive_proj_256,transformer,6.9775,6,21,4.2562,6.9856,0.0000,0.0000,0.0000,-0.0256,235.5,256,6,8,0.07,256,0.000282842712474619,1024,2,0.1,cls,1500,0.1,0.05,3238944
+2026-03-13 09:14:59,contrastive_dropout_0.15,transformer,6.9750,14,29,4.2573,6.9883,0.0000,0.0000,0.0000,-0.0287,234.9,256,6,8,0.07,128,0.000282842712474619,1024,2,0.15,cls,1500,0.1,0.05,3238944
+2026-03-13 10:40:29,contrastive_cosine_restarts,transformer,6.9777,6,21,4.2589,6.9876,0.0000,0.0000,0.0000,-0.0266,235.2,256,6,8,0.07,128,0.000282842712474619,1024,2,0.1,cls,1500,0.1,0.05,3238944

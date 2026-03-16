@@ -12,6 +12,7 @@ wheels/
 # Data files (large binary data)
 *.hdf5
 sequences/
+docs*
 
 # Model checkpoints (large, regeneratable)
 checkpoints/
@@ -24,7 +25,11 @@ runs/
 # Images generated during experiments
 images/
 tests/test_results*
+tests/bundle_analysis* 
+tests/comparison*
+tests/wdice_results*
 
 # Jupyter notebooks checkpoints
 .ipynb_checkpoints/
 
+tests/bundle_analysis

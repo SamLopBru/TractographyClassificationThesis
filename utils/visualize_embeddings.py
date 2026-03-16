@@ -36,9 +36,9 @@ from typing import Optional, Tuple
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.encoder import StreamlineEncoder, LightweightStreamlineEncoder
-from src.dataloader import StreamlineDataset, streamline_collate_fn
+from src.encoder import TransformerEncoder, LSTMEncoder
 from src.config import TrainConfig, DEFAULT_CONFIG
+from utils.dataloader import StreamlineDataset, streamline_collate_fn
 
 
 def load_encoder(
@@ -64,7 +64,7 @@ def load_encoder(
     
     # Create encoder
     if encoder_type == 'transformer':
-        encoder = StreamlineEncoder(
+        encoder = TransformerEncoder(
             input_size=config.input_size,
             d_model=_d_model,
             nhead=config.nhead,
@@ -75,7 +75,7 @@ def load_encoder(
             pooling=pooling
         )
     else:
-        encoder = LightweightStreamlineEncoder(
+        encoder = LSTMEncoder(
             input_size=config.input_size,
             hidden_size=_d_model,
             num_layers=_num_layers,
@@ -321,7 +321,7 @@ def main():
                         help='Directory containing HDF5 files to visualize')
     parser.add_argument('--output_dir', type=str, default='visualizations',
                         help='Directory to save plots')
-    parser.add_argument('--max_samples', type=int, default=10000,
+    parser.add_argument('--max_samples', type=int, default=100000,
                         help='Maximum number of samples to visualize')
     parser.add_argument('--method', type=str, default='tsne',
                         choices=['tsne', 'umap', 'both'],

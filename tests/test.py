@@ -205,7 +205,7 @@ def compute_metrics(
     # Top-k accuracy
     if num_classes > 2:
         for k in [3, 5]:
-            if k <= num_classes:
+            if k < num_classes:
                 metrics[f'top_{k}_accuracy'] = top_k_accuracy_score(labels, probs, k=k) * 100
     
     # Confusion matrix
@@ -529,8 +529,6 @@ def main():
     parser.add_argument('--scope', type=str, default='testset',
                         choices=['trainset', 'validset', 'testset'],
                         help='Dataset scope for wDice evaluation')
-    parser.add_argument('--wdice_output_dir', type=str, default=None,
-                        help='Directory to save wDice results (default: <output_dir>/wdice)')
 
     args = parser.parse_args()
     
@@ -692,7 +690,7 @@ def main():
         from utils.dataset_handler import Tractoinferno_handler
         from collections import defaultdict as _defaultdict
 
-        wdice_out = args.wdice_output_dir or os.path.join(args.output_dir, 'wdice')
+        wdice_out = os.path.join(args.output_dir, 'wdice')
         os.makedirs(wdice_out, exist_ok=True)
 
         # Get test HDF5 files
@@ -819,13 +817,14 @@ def main():
         print(f"📁 wDice results saved to: {wdice_out}/")
 
 
-def compare_test_results(results_dir: str = 'tests/test_results'):
+def compare_test_results(results_dir: str = 'tests/test_results',
+                         wdice_dir: str = 'tests/wdice_results'):
     """
     Compare test results across all experiments.
 
     Scans subdirectories of results_dir for test_metrics.json and
     classification_report.txt, then generates:
-      - summary_comparison.csv  (overall metrics per experiment)
+      - summary_comparison.csv  (overall metrics per experiment, including mean_wDice)
       - per_class_comparison.csv (per-class F1 with best/worst analysis)
       - overview_comparison.png
       - per_class_f1_heatmap.png
@@ -856,6 +855,27 @@ def compare_test_results(results_dir: str = 'tests/test_results'):
 
         with open(metrics_file) as f:
             metrics = json.load(f)
+
+        # Look for wDice data if not already in test_metrics.json
+        if 'mean_wDice' not in metrics:
+            wdice_path = Path(wdice_dir)
+            if wdice_path.is_dir():
+                # Try exact match first, then partial/substring match
+                wdice_agg = wdice_path / exp_dir.name / 'wdice_aggregate.json'
+                if not wdice_agg.exists():
+                    # Try matching: wdice dir name is a substring of experiment name
+                    for wd in sorted(wdice_path.iterdir()):
+                        if wd.is_dir() and wd.name in exp_dir.name:
+                            candidate = wd / 'wdice_aggregate.json'
+                            if candidate.exists():
+                                wdice_agg = candidate
+                                break
+                if wdice_agg.exists():
+                    with open(wdice_agg) as wf:
+                        wdice_data = json.load(wf)
+                    if 'mean_wDice' in wdice_data:
+                        metrics['mean_wDice'] = wdice_data['mean_wDice']
+
         experiments[exp_dir.name] = metrics
 
         # Parse per-class F1 from classification_report.txt
@@ -879,11 +899,15 @@ def compare_test_results(results_dir: str = 'tests/test_results'):
     # --- 2. Summary comparison CSV ---
     summary_rows = []
     metric_keys = ['accuracy', 'f1_macro', 'f1_weighted', 'precision_macro',
-                   'recall_macro', 'top_3_accuracy', 'top_5_accuracy']
+                   'recall_macro', 'top_3_accuracy', 'top_5_accuracy',
+                   'mean_wDice']
     for name, m in experiments.items():
         row = {'experiment': name}
         for k in metric_keys:
             row[k] = m.get(k, None)
+        # Convert mean_wDice to percentage for consistency with other metrics
+        if row.get('mean_wDice') is not None:
+            row['mean_wDice'] = row['mean_wDice'] * 100
         summary_rows.append(row)
 
     df_summary = pd.DataFrame(summary_rows).sort_values('f1_macro', ascending=False)
@@ -1113,7 +1137,14 @@ if __name__ == '__main__':
             results_dir = _sys.argv[idx + 1]
             _sys.argv.pop(idx)
             _sys.argv.pop(idx)
-        compare_test_results(results_dir)
+        # Check for optional --wdice_dir argument
+        wdice_dir = 'tests/wdice_results'
+        if '--wdice_dir' in _sys.argv:
+            idx = _sys.argv.index('--wdice_dir')
+            wdice_dir = _sys.argv[idx + 1]
+            _sys.argv.pop(idx)
+            _sys.argv.pop(idx)
+        compare_test_results(results_dir, wdice_dir)
     else:
         main()
 

@@ -1,14 +1,8 @@
-pretrained_encoder: uv run src/contrastive_train.py \
-  --pooling cls \
-  --epochs 30 \
-  --patience 15 \
-  --warmup_steps 1500 \
-  --batch_size 1024 \
-  --accumulation_steps 4 \
-  --epoch_sampling_pct 0.10 \
-  --save_dir checkpoints/contrastive \
-  --temperature 0.07 \
-  --validate_every 2
+uv run src/train.py --experiment_name transformer_retrain_base_config --epochs 40 --patience 10 --warmup_steps 1500 --batch_size 1024 --pooling cls --accumulation_steps 2
 
-encoder_transformer: uv run src/train.py --epochs 40 --patience 10 \
---warmup_steps 1500 --batch_size 1024 --pooling cls --accumulation_steps 2
+uv run src/contrastive_train.py \
+    --experiment_name contrastive_pretrain_base_config \
+    --d_model 256 --num_layers 6 --nhead 8 --pooling cls \
+    --temperature 0.07 --projection_dim 128 \
+    --warmup_steps 1500 --epochs 30 --patience 15 \
+    --batch_size 1024

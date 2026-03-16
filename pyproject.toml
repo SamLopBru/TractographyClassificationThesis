@@ -6,10 +6,14 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "dipy>=1.11.0",
+    "fury>=0.12.0",
+    "kaleido>=1.2.0",
     "matplotlib>=3.10.8",
     "nibabel>=5.3.3",
     "numpy>=2.4.1",
+    "pacmap>=0.9.1",
     "pandas>=2.3.3",
+    "plotly>=6.5.2",
     "scikit-learn>=1.8.0",
     "scipy>=1.17.0",
     "seaborn>=0.13.2",
