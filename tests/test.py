@@ -14,6 +14,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.amp import autocast
 from pathlib import Path
+import pathlib
 import os
 import sys
 import argparse
@@ -41,10 +42,20 @@ from sklearn.metrics import (
 from sklearn.preprocessing import label_binarize
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
-from src.encoder import StreamlineEncoder, LightweightStreamlineEncoder
-from src.dataloader import StreamlineDataset, streamline_collate_fn
+from src.encoder import TransformerEncoder, LSTMEncoder
+from utils.dataloader import StreamlineDataset, streamline_collate_fn
 from src.config import TrainConfig, DEFAULT_CONFIG
+
+# wDice evaluation imports (lazy-loaded in the wDice branch)
+from wDice import (
+    ENCODED_TRACTS, ID_TO_TRACT,
+    run_inference_per_subject,
+    load_subject_streamlines,
+    compute_subject_wdice,
+    plot_wdice_results,
+)
 
 
 def load_model(
@@ -52,13 +63,32 @@ def load_model(
     config: TrainConfig,
     device: torch.device
 ) -> nn.Module:
-    """Load a trained model from checkpoint."""
+    """Load a trained model from checkpoint.
+    
+    Reads the saved 'params' dict from the checkpoint to reconstruct
+    the exact model architecture used during training, falling back
+    to the provided config for any missing keys.
+    """
     
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
+    # Override config with params saved in the checkpoint (if available)
+    saved_params = checkpoint.get('params', {})
+    if saved_params:
+        print(f"Loading model config from checkpoint params")
+        for key in ['encoder_type', 'd_model', 'nhead', 'num_layers', 
+                    'dim_feedforward', 'num_classes', 'dropout', 
+                    'pooling', 'pos_encoding', 'input_size', 'norm_layer',
+                    'deep_classifier']:
+            if key in saved_params:
+                setattr(config, key, saved_params[key])
+                print(f"  {key}: {saved_params[key]}")
+    else:
+        print("WARNING: No 'params' found in checkpoint, using default config")
+    
     # Create model based on config
     if config.encoder_type == 'transformer':
-        model = StreamlineEncoder(
+        model = TransformerEncoder(
             input_size=config.input_size,
             d_model=config.d_model,
             nhead=config.nhead,
@@ -66,11 +96,13 @@ def load_model(
             dim_feedforward=config.dim_feedforward,
             num_classes=config.num_classes,
             dropout=config.dropout,
-            pooling="cls",
-            pos_encoding=config.pos_encoding
+            pooling=config.pooling,
+            pos_encoding=config.pos_encoding,
+            norm_layer=getattr(config, 'norm_layer', 'layernorm'),
+            deep_classifier=getattr(config, 'deep_classifier', False)
         )
     else:
-        model = LightweightStreamlineEncoder(
+        model = LSTMEncoder(
             input_size=config.input_size,
             hidden_size=config.d_model,
             num_layers=config.num_layers,
@@ -88,6 +120,8 @@ def load_model(
     print(f"Loaded model from epoch {checkpoint.get('epoch', 'unknown')}")
     if 'val_accuracy' in checkpoint:
         print(f"Checkpoint validation accuracy: {checkpoint['val_accuracy']:.2f}%")
+    if 'val_macro_f1' in checkpoint:
+        print(f"Checkpoint validation F1: {checkpoint['val_macro_f1']:.2f}%")
     
     return model, checkpoint
 
@@ -168,7 +202,7 @@ def compute_metrics(
     metrics['recall_per_class'] = recall_score(labels, preds, average=None, zero_division=0) * 100
     metrics['f1_per_class'] = f1_score(labels, preds, average=None, zero_division=0) * 100
     
-    # Top-k accuracy (if more than 2 classes)
+    # Top-k accuracy
     if num_classes > 2:
         for k in [3, 5]:
             if k <= num_classes:
@@ -474,7 +508,7 @@ def main():
                         help='Path to model checkpoint')
     parser.add_argument('--output_dir', type=str, default='tests/test_results',
                         help='Directory to save results')
-    parser.add_argument('--batch_size', type=int, default=cfg.batch_size,
+    parser.add_argument('--batch_size', type=int, default=4096,
                         help='Batch size for inference')
     parser.add_argument('--num_workers', type=int, default=cfg.num_workers,
                         help='DataLoader workers')
@@ -486,6 +520,18 @@ def main():
                         choices=['absolute', 'rope'],
                         help='Positional encoding type (must match trained model)')
     
+    # ── wDice arguments ──
+    parser.add_argument('--wdice', action='store_true',
+                        help='Also compute volumetric weighted Dice (wDice) after classification metrics')
+    parser.add_argument('--tractoinferno_dir', type=str,
+                        default='/home/blancolote/TFM/Tractoinferno/ds003900-download/derivatives',
+                        help='Path to Tractoinferno derivatives directory (for wDice)')
+    parser.add_argument('--scope', type=str, default='testset',
+                        choices=['trainset', 'validset', 'testset'],
+                        help='Dataset scope for wDice evaluation')
+    parser.add_argument('--wdice_output_dir', type=str, default=None,
+                        help='Directory to save wDice results (default: <output_dir>/wdice)')
+
     args = parser.parse_args()
     
     # Device
@@ -522,7 +568,7 @@ def main():
     # Create dataloader
     test_loader = DataLoader(
         test_dataset,
-        batch_size=4096,
+        batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
@@ -637,14 +683,439 @@ def main():
         json.dump(metrics_to_save, f, indent=2)
     print(f"\nSaved metrics to {metrics_file}")
     
+    # ── Optional wDice evaluation ──
+    if args.wdice:
+        print("\n" + "=" * 60)
+        print("WEIGHTED DICE (wDice) EVALUATION")
+        print("=" * 60)
+
+        from utils.dataset_handler import Tractoinferno_handler
+        from collections import defaultdict as _defaultdict
+
+        wdice_out = args.wdice_output_dir or os.path.join(args.output_dir, 'wdice')
+        os.makedirs(wdice_out, exist_ok=True)
+
+        # Get test HDF5 files
+        hdf5_files = sorted(test_dir.glob('*.hdf5'))
+
+        # Set up dataset handler for loading original .trk files
+        dataset_handler = Tractoinferno_handler(args.tractoinferno_dir, scope=args.scope)
+        subjects_data = {s['subject']: s for s in dataset_handler.get_data()}
+
+        # Process each subject
+        all_subject_results = {}
+        aggregate_wdice = _defaultdict(list)
+
+        for i, hdf5_path in enumerate(hdf5_files):
+            subject_name = hdf5_path.stem
+            print(f"\n{'─'*60}")
+            print(f"[{i+1}/{len(hdf5_files)}] Processing {subject_name}")
+            print(f"{'─'*60}")
+
+            if subject_name not in subjects_data:
+                print(f"  ⚠ Subject {subject_name} not found in Tractoinferno {args.scope}, skipping")
+                continue
+
+            subject_info = subjects_data[subject_name]
+            subject_path = pathlib.Path(subject_info['T1w']).parent.parent
+            mri_path = subject_info['T1w']
+
+            # Run inference per subject (uses the already-loaded model)
+            print(f"  🧠 Running per-subject inference...")
+            gt_labels_subj, pred_labels_subj, _ = run_inference_per_subject(
+                model, str(hdf5_path), device,
+                batch_size=args.batch_size,
+                use_amp=not args.no_amp
+            )
+            accuracy_subj = np.mean(np.array(gt_labels_subj) == np.array(pred_labels_subj)) * 100
+            print(f"  📈 Subject accuracy: {accuracy_subj:.2f}%")
+
+            # Load original .trk streamlines
+            print(f"  📂 Loading original .trk streamlines...")
+            tract_streamlines, affine = load_subject_streamlines(subject_path, mri_path)
+            total_original = sum(len(sls) for sls in tract_streamlines.values())
+            print(f"  📊 Loaded {total_original} original streamlines from {len(tract_streamlines)} bundles")
+
+            # Compute wDice
+            print(f"  🎲 Voxelizing and computing wDice...")
+            subject_results = compute_subject_wdice(
+                tract_streamlines, gt_labels_subj, pred_labels_subj, affine
+            )
+
+            all_subject_results[subject_name] = subject_results
+            for bundle, score in subject_results.items():
+                aggregate_wdice[bundle].append(score)
+
+            print(f"  ✅ Mean wDice: {subject_results['mean_wDice']:.4f}")
+
+        # Aggregate results across subjects
+        if all_subject_results:
+            print(f"\n{'='*60}")
+            print("AGGREGATE wDice RESULTS")
+            print(f"{'='*60}")
+
+            mean_results = {}
+            for bundle, scores in aggregate_wdice.items():
+                if bundle != 'mean_wDice':
+                    mean_results[bundle] = float(np.mean(scores))
+            mean_results['mean_wDice'] = float(np.mean(
+                [v for k, v in mean_results.items() if k != 'mean_wDice']
+            ))
+
+            print(f"\nOverall Mean wDice: {mean_results['mean_wDice']:.4f}")
+            print(f"\nPer-bundle wDice (averaged across {len(all_subject_results)} subjects):")
+            for bundle in sorted(mean_results.keys()):
+                if bundle != 'mean_wDice':
+                    print(f"  {bundle:15s}: {mean_results[bundle]:.4f}")
+
+            # Save per-subject JSON
+            json_path = os.path.join(wdice_out, 'wdice_per_subject.json')
+            with open(json_path, 'w') as f:
+                json.dump(all_subject_results, f, indent=2)
+            print(f"\n💾 Per-subject wDice saved to {json_path}")
+
+            # Save aggregate JSON
+            agg_json_path = os.path.join(wdice_out, 'wdice_aggregate.json')
+            with open(agg_json_path, 'w') as f:
+                json.dump(mean_results, f, indent=2)
+            print(f"💾 Aggregate wDice saved to {agg_json_path}")
+
+            # CSV summary
+            try:
+                import pandas as pd
+                rows = []
+                for subj, results in all_subject_results.items():
+                    row = {'subject': subj}
+                    row.update(results)
+                    rows.append(row)
+                df = pd.DataFrame(rows)
+                csv_path = os.path.join(wdice_out, 'wdice_results.csv')
+                df.to_csv(csv_path, index=False)
+                print(f"💾 CSV summary saved to {csv_path}")
+            except ImportError:
+                pass
+
+            # Plot wDice results
+            plot_wdice_results(
+                mean_results,
+                os.path.join(wdice_out, 'wdice_per_bundle.png'),
+                title="Per-Bundle wDice (Averaged Across Subjects)"
+            )
+
+            # Add wDice to the saved metrics JSON
+            metrics_to_save['mean_wDice'] = mean_results['mean_wDice']
+            with open(metrics_file, 'w') as f:
+                json.dump(metrics_to_save, f, indent=2)
+            print(f"📝 Updated {metrics_file} with mean_wDice")
+
+        else:
+            print("\n⚠ No subjects processed for wDice!")
+
     print("\n" + "=" * 60)
     print("EVALUATION COMPLETE")
     print("=" * 60)
     print(f"\n📁 All results saved to: {args.output_dir}/")
+    if args.wdice:
+        print(f"📁 wDice results saved to: {wdice_out}/")
+
+
+def compare_test_results(results_dir: str = 'tests/test_results'):
+    """
+    Compare test results across all experiments.
+
+    Scans subdirectories of results_dir for test_metrics.json and
+    classification_report.txt, then generates:
+      - summary_comparison.csv  (overall metrics per experiment)
+      - per_class_comparison.csv (per-class F1 with best/worst analysis)
+      - overview_comparison.png
+      - per_class_f1_heatmap.png
+      - per_class_f1_delta.png
+      - per_class_f1_scatter.png
+      - radar_comparison.png
+      - best_model_per_class.png
+    """
+    import pandas as pd
+    import re
+    from matplotlib.patches import FancyBboxPatch
+
+    results_path = Path(results_dir)
+    comparison_dir = results_path / 'comparison'
+    comparison_dir.mkdir(exist_ok=True)
+
+    # --- 1. Collect metrics from every experiment ---
+    experiments = {}
+    per_class_f1 = {}
+
+    for exp_dir in sorted(results_path.iterdir()):
+        if not exp_dir.is_dir() or exp_dir.name == 'comparison':
+            continue
+        metrics_file = exp_dir / 'test_metrics.json'
+        report_file = exp_dir / 'classification_report.txt'
+        if not metrics_file.exists():
+            continue
+
+        with open(metrics_file) as f:
+            metrics = json.load(f)
+        experiments[exp_dir.name] = metrics
+
+        # Parse per-class F1 from classification_report.txt
+        if report_file.exists():
+            with open(report_file) as f:
+                lines = f.readlines()
+            class_f1 = {}
+            for line in lines:
+                # Match lines like "    Bundle_0       0.99      1.00      1.00    279842"
+                m = re.match(r'\s+(Bundle_\d+)\s+[\d.]+\s+[\d.]+\s+([\d.]+)\s+\d+', line)
+                if m:
+                    class_f1[m.group(1)] = float(m.group(2))
+            per_class_f1[exp_dir.name] = class_f1
+
+    if not experiments:
+        print("No experiment results found!")
+        return
+
+    print(f"Found {len(experiments)} experiments to compare")
+
+    # --- 2. Summary comparison CSV ---
+    summary_rows = []
+    metric_keys = ['accuracy', 'f1_macro', 'f1_weighted', 'precision_macro',
+                   'recall_macro', 'top_3_accuracy', 'top_5_accuracy']
+    for name, m in experiments.items():
+        row = {'experiment': name}
+        for k in metric_keys:
+            row[k] = m.get(k, None)
+        summary_rows.append(row)
+
+    df_summary = pd.DataFrame(summary_rows).sort_values('f1_macro', ascending=False)
+    df_summary.to_csv(comparison_dir / 'summary_comparison.csv', index=False)
+    print(f"  Saved summary_comparison.csv")
+
+    # --- 3. Per-class comparison CSV ---
+    if per_class_f1:
+        df_class = pd.DataFrame(per_class_f1)
+        # Add analysis columns
+        df_class['best_model'] = df_class.idxmax(axis=1)
+        df_class['best_f1'] = df_class.drop(columns=['best_model'], errors='ignore').max(axis=1)
+        df_class['worst_f1'] = df_class.drop(columns=['best_model', 'best_f1'], errors='ignore').min(axis=1)
+        df_class['delta'] = df_class['best_f1'] - df_class['worst_f1']
+        df_class.to_csv(comparison_dir / 'per_class_comparison.csv')
+        print(f"  Saved per_class_comparison.csv")
+
+    # --- 4. Overview comparison plot ---
+    _plot_overview_comparison(df_summary, comparison_dir)
+
+    # --- 5. Per-class F1 heatmap ---
+    if per_class_f1:
+        _plot_per_class_heatmap(per_class_f1, comparison_dir)
+        _plot_per_class_delta(per_class_f1, comparison_dir)
+        _plot_per_class_scatter(per_class_f1, comparison_dir)
+        _plot_best_model_per_class(per_class_f1, comparison_dir)
+
+    # --- 6. Radar comparison ---
+    _plot_radar_comparison(experiments, comparison_dir)
+
+    print(f"\n📁 Comparison results saved to: {comparison_dir}/")
+
+
+def _plot_overview_comparison(df_summary: 'pd.DataFrame', out_dir: Path):
+    """Bar chart comparing overall metrics across experiments."""
+    import pandas as pd
+
+    metrics_to_plot = ['accuracy', 'f1_macro', 'f1_weighted', 'precision_macro', 'recall_macro']
+    available = [m for m in metrics_to_plot if m in df_summary.columns]
+
+    fig, ax = plt.subplots(figsize=(max(14, len(df_summary) * 1.5), 7))
+    x = np.arange(len(df_summary))
+    width = 0.15
+    colors = ['#2ecc71', '#3498db', '#e74c3c', '#f39c12', '#9b59b6']
+
+    for i, metric in enumerate(available):
+        offset = (i - len(available) / 2) * width
+        vals = df_summary[metric].values
+        ax.bar(x + offset, vals, width, label=metric.replace('_', ' ').title(), color=colors[i % len(colors)])
+
+    ax.set_xlabel('Experiment', fontsize=12)
+    ax.set_ylabel('Score (%)', fontsize=12)
+    ax.set_title('Overall Metrics Comparison', fontsize=14)
+    ax.set_xticks(x)
+    ax.set_xticklabels(df_summary['experiment'], rotation=45, ha='right', fontsize=9)
+    ax.legend(fontsize=9)
+    ax.set_ylim(min(df_summary[available].min().min() - 2, 85), 100)
+    ax.grid(axis='y', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_dir / 'overview_comparison.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved overview_comparison.png")
+
+
+def _plot_per_class_heatmap(per_class_f1: Dict, out_dir: Path):
+    """Heatmap of per-class F1 across experiments."""
+    import pandas as pd
+
+    df = pd.DataFrame(per_class_f1)
+
+    fig, ax = plt.subplots(figsize=(max(12, len(df.columns) * 1.2), max(10, len(df) * 0.4)))
+    sns.heatmap(df, annot=True, fmt='.2f', cmap='RdYlGn', ax=ax,
+                vmin=0.4, vmax=1.0, linewidths=0.5,
+                cbar_kws={'label': 'F1 Score'})
+    ax.set_title('Per-Class F1 Score Comparison', fontsize=14)
+    ax.set_xlabel('Experiment', fontsize=12)
+    ax.set_ylabel('Class', fontsize=12)
+    plt.xticks(rotation=45, ha='right', fontsize=9)
+    plt.tight_layout()
+    plt.savefig(out_dir / 'per_class_f1_heatmap.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved per_class_f1_heatmap.png")
+
+
+def _plot_per_class_delta(per_class_f1: Dict, out_dir: Path):
+    """Bar chart showing F1 variability (max - min) per class across experiments."""
+    import pandas as pd
+
+    df = pd.DataFrame(per_class_f1)
+    deltas = df.max(axis=1) - df.min(axis=1)
+    deltas = deltas.sort_values(ascending=False)
+
+    fig, ax = plt.subplots(figsize=(max(12, len(deltas) * 0.5), 6))
+    colors = ['#e74c3c' if d > 0.03 else '#f39c12' if d > 0.01 else '#2ecc71' for d in deltas.values]
+    ax.bar(range(len(deltas)), deltas.values, color=colors, edgecolor='#2c3e50', linewidth=0.5)
+    ax.set_xticks(range(len(deltas)))
+    ax.set_xticklabels(deltas.index, rotation=45, ha='right', fontsize=9)
+    ax.set_xlabel('Class', fontsize=12)
+    ax.set_ylabel('F1 Delta (max - min)', fontsize=12)
+    ax.set_title('Per-Class F1 Variability Across Experiments', fontsize=14)
+    ax.grid(axis='y', alpha=0.3)
+
+    # Add value labels
+    for i, (idx, val) in enumerate(deltas.items()):
+        ax.text(i, val + 0.002, f'{val:.3f}', ha='center', va='bottom', fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(out_dir / 'per_class_f1_delta.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved per_class_f1_delta.png")
+
+
+def _plot_per_class_scatter(per_class_f1: Dict, out_dir: Path):
+    """Scatter plot: each dot is (class, F1) with one series per experiment."""
+    import pandas as pd
+
+    df = pd.DataFrame(per_class_f1)
+    exp_names = df.columns.tolist()
+
+    fig, ax = plt.subplots(figsize=(max(14, len(df) * 0.5), 7))
+    markers = ['o', 's', '^', 'D', 'v', '>', '<', 'p', '*', 'h']
+    colors = plt.cm.tab10(np.linspace(0, 1, len(exp_names)))
+
+    for i, exp in enumerate(exp_names):
+        ax.scatter(range(len(df)), df[exp].values,
+                   label=exp, marker=markers[i % len(markers)],
+                   color=colors[i], s=50, alpha=0.8, edgecolors='#2c3e50', linewidths=0.5)
+
+    ax.set_xticks(range(len(df)))
+    ax.set_xticklabels(df.index, rotation=45, ha='right', fontsize=9)
+    ax.set_xlabel('Class', fontsize=12)
+    ax.set_ylabel('F1 Score', fontsize=12)
+    ax.set_title('Per-Class F1 Scores Across Experiments', fontsize=14)
+    ax.legend(fontsize=8, bbox_to_anchor=(1.02, 1), loc='upper left')
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0.3, 1.05)
+    plt.tight_layout()
+    plt.savefig(out_dir / 'per_class_f1_scatter.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved per_class_f1_scatter.png")
+
+
+def _plot_best_model_per_class(per_class_f1: Dict, out_dir: Path):
+    """Horizontal bar chart showing which model is best for each class."""
+    import pandas as pd
+
+    df = pd.DataFrame(per_class_f1)
+    best_models = df.idxmax(axis=1)
+    best_f1 = df.max(axis=1)
+
+    unique_models = best_models.unique()
+    model_colors = {m: plt.cm.Set2(i / max(len(unique_models) - 1, 1))
+                    for i, m in enumerate(unique_models)}
+
+    fig, ax = plt.subplots(figsize=(12, max(8, len(df) * 0.35)))
+    y_pos = np.arange(len(df))
+    bar_colors = [model_colors[m] for m in best_models.values]
+
+    ax.barh(y_pos, best_f1.values, color=bar_colors, edgecolor='#2c3e50', linewidth=0.5)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(df.index, rotation=0, ha='right', fontsize=9)
+    ax.invert_yaxis()
+    ax.set_xlabel('Best F1 Score', fontsize=12)
+    ax.set_title('Best Model Per Class', fontsize=14)
+    ax.set_xlim(0.4, 1.05)
+    ax.grid(axis='x', alpha=0.3)
+
+    # Add model name labels
+    for i, (f1_val, model) in enumerate(zip(best_f1.values, best_models.values)):
+        ax.text(f1_val + 0.005, i, f'{model} ({f1_val:.2f})',
+                va='center', fontsize=8)
+
+    # Legend
+    handles = [plt.Rectangle((0, 0), 1, 1, color=model_colors[m]) for m in unique_models]
+    ax.legend(handles, unique_models, fontsize=8, loc='lower right')
+
+    plt.tight_layout()
+    plt.savefig(out_dir / 'best_model_per_class.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved best_model_per_class.png")
+
+
+def _plot_radar_comparison(experiments: Dict, out_dir: Path):
+    """Radar chart comparing key metrics across experiments."""
+
+    metrics_for_radar = ['accuracy', 'f1_macro', 'f1_weighted',
+                         'precision_macro', 'recall_macro']
+    labels = [m.replace('_', ' ').title() for m in metrics_for_radar]
+    num_vars = len(labels)
+
+    # Compute angles for radar chart
+    angles = np.linspace(0, 2 * np.pi, num_vars, endpoint=False).tolist()
+    angles += angles[:1]  # Close the polygon
+
+    fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(polar=True))
+    colors = plt.cm.tab10(np.linspace(0, 1, len(experiments)))
+
+    for i, (name, metrics) in enumerate(experiments.items()):
+        values = [metrics.get(m, 0) for m in metrics_for_radar]
+        values += values[:1]  # Close the polygon
+        ax.plot(angles, values, 'o-', linewidth=1.5, label=name,
+                color=colors[i], markersize=4)
+        ax.fill(angles, values, alpha=0.05, color=colors[i])
+
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(labels, fontsize=10)
+    ax.set_ylim(85, 95)
+    ax.set_title('Metrics Radar Comparison', fontsize=14, pad=20)
+    ax.legend(fontsize=8, loc='upper right', bbox_to_anchor=(1.3, 1.1))
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(out_dir / 'radar_comparison.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved radar_comparison.png")
 
 
 if __name__ == '__main__':
-    main()
+    import sys as _sys
+    if '--compare' in _sys.argv:
+        # Remove --compare from argv so argparse doesn't complain
+        _sys.argv.remove('--compare')
+        # Check for optional --results_dir argument
+        results_dir = 'tests/test_results'
+        if '--results_dir' in _sys.argv:
+            idx = _sys.argv.index('--results_dir')
+            results_dir = _sys.argv[idx + 1]
+            _sys.argv.pop(idx)
+            _sys.argv.pop(idx)
+        compare_test_results(results_dir)
+    else:
+        main()
 
 
 """
@@ -667,4 +1138,16 @@ python test.py --no_amp
 
 # Test on a subset of data (10%)
 python test.py --sampling_pct 0.1
+
+# Run classification metrics + wDice in one go
+python test.py --checkpoint checkpoints/exp/best_model.pt --wdice
+
+# Run with custom wDice output directory
+python test.py --wdice --wdice_output_dir tests/wdice_results/my_exp
+
+# Compare all test results across experiments
+python test.py --compare
+
+# Compare results from a custom directory
+python test.py --compare --results_dir path/to/test_results
 """
