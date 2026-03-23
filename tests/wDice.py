@@ -156,6 +156,26 @@ def compute_wdice(
     return numerator / denominator if denominator > 0 else 0.0
 
 
+def compute_dice(
+    density_ref: Dict[tuple, int],
+    density_pred: Dict[tuple, int]
+) -> float:
+    """
+    Compute standard volumetric Dice score.
+
+    Dice = 2 * |A ∩ B| / (|A| + |B|)
+    where A and B are the sets of voxels with positive density.
+    """
+    if not density_ref or not density_pred:
+        return 0.0
+
+    common_voxels = set(density_ref.keys()) & set(density_pred.keys())
+    numerator = 2.0 * len(common_voxels)
+    denominator = len(density_ref) + len(density_pred)
+
+    return numerator / denominator if denominator > 0 else 0.0
+
+
 # ───────────────────────── Per-subject inference ──────────────────────────── #
 
 @torch.no_grad()
@@ -165,19 +185,24 @@ def run_inference_per_subject(
     device: torch.device,
     batch_size: int = 4096,
     use_amp: bool = True,
+    preds_dir: Optional[str] = None
 ) -> Tuple[List[int], List[np.ndarray], List[np.ndarray]]:
     """
     Run inference on a single subject's HDF5 file.
 
     Iterates over tract groups in the HDF5 in sorted order (tract_0,
     tract_1, …) so that we can match predictions back to the original
-    .trk files.
-
-    Returns:
-        gt_labels:  List of ground-truth tract IDs (one per streamline).
-        all_preds:  List of predicted tract IDs (one per streamline).
-        all_probs:  List of softmax probability vectors.
+    .trk files. If preds_dir is provided, saves or loads predictions to avoid
+    recomputing.
     """
+    subject_name = pathlib.Path(hdf5_path).stem
+    if preds_dir is not None:
+        preds_file = os.path.join(preds_dir, f"{subject_name}_preds.npz")
+        if os.path.exists(preds_file):
+            print(f"    📦 Loading saved predictions from {preds_file}")
+            data = np.load(preds_file)
+            return data['gt_labels'].tolist(), data['all_preds'].tolist(), data['all_probs']
+
     gt_labels = []
     all_preds = []
     all_probs = []
@@ -230,6 +255,16 @@ def run_inference_per_subject(
                 all_probs.append(probs)
 
     all_probs = np.concatenate(all_probs, axis=0) if all_probs else np.array([])
+    
+    if preds_dir is not None:
+        os.makedirs(preds_dir, exist_ok=True)
+        preds_file = os.path.join(preds_dir, f"{subject_name}_preds.npz")
+        np.savez_compressed(preds_file, 
+                 gt_labels=np.array(gt_labels), 
+                 all_preds=np.array(all_preds), 
+                 all_probs=all_probs)
+        print(f"    💾 Saved predictions to {preds_file}")
+        
     return gt_labels, all_preds, all_probs
 
 
@@ -314,9 +349,10 @@ def compute_subject_wdice(
     for sl, gt_label in zip(all_streamlines, gt_labels):
         ref_groups[gt_label].append(sl)
 
-    # Compute per-bundle wDice
+    # Compute per-bundle wDice and Dice
     results = {}
     per_bundle_wdice = []
+    per_bundle_dice = []
 
     all_tract_ids = sorted(set(list(ref_groups.keys()) + list(pred_groups.keys())))
 
@@ -331,12 +367,17 @@ def compute_subject_wdice(
 
         density_ref = voxelize_streamlines(ref_sls, affine) if ref_sls else {}
         density_pred = voxelize_streamlines(pred_sls, affine) if pred_sls else {}
+        
         wdice = compute_wdice(density_ref, density_pred)
+        dice = compute_dice(density_ref, density_pred)
 
         results[tract_name] = wdice
+        results[f"{tract_name}_Dice"] = dice
         per_bundle_wdice.append(wdice)
+        per_bundle_dice.append(dice)
 
     results['mean_wDice'] = float(np.mean(per_bundle_wdice)) if per_bundle_wdice else 0.0
+    results['mean_Dice'] = float(np.mean(per_bundle_dice)) if per_bundle_dice else 0.0
     return results
 
 
@@ -411,6 +452,8 @@ def main():
                         help='Batch size for inference')
     parser.add_argument('--no_amp', action='store_true',
                         help='Disable mixed precision')
+    parser.add_argument('--preds_dir', type=str, default=None,
+                        help='Directory to save/load predictions to avoid recomputing')
 
     args = parser.parse_args()
 
@@ -464,11 +507,11 @@ def main():
         mri_path = subject_info['T1w']
 
         # Step 1: Run model inference on HDF5
-        print(f"  🧠 Running inference...")
         gt_labels, pred_labels, _ = run_inference_per_subject(
             model, str(hdf5_path), device,
             batch_size=args.batch_size,
-            use_amp=not args.no_amp
+            use_amp=not args.no_amp,
+            preds_dir=args.preds_dir
         )
         accuracy = np.mean(np.array(gt_labels) == np.array(pred_labels)) * 100
         print(f"  📈 Subject accuracy: {accuracy:.2f}%")
@@ -489,7 +532,7 @@ def main():
         for bundle, score in subject_results.items():
             aggregate_wdice[bundle].append(score)
 
-        print(f"  ✅ Mean wDice: {subject_results['mean_wDice']:.4f}")
+        print(f"  ✅ Mean wDice: {subject_results['mean_wDice']:.4f}  |  Mean Dice: {subject_results['mean_Dice']:.4f}")
 
     # ── Aggregate results across subjects ──
     if not all_subject_results:
@@ -500,20 +543,29 @@ def main():
     print("AGGREGATE RESULTS")
     print(f"{'='*60}")
 
-    # Compute mean wDice per bundle across all subjects
+    # Compute mean wDice and mean Dice per bundle across all subjects
     mean_results = {}
     for bundle, scores in aggregate_wdice.items():
-        if bundle != 'mean_wDice':
+        if bundle not in ['mean_wDice', 'mean_Dice']:
             mean_results[bundle] = float(np.mean(scores))
-    mean_results['mean_wDice'] = float(np.mean(
-        [v for k, v in mean_results.items() if k != 'mean_wDice']
-    ))
+            
+    wDice_keys = [k for k in mean_results.keys() if not k.endswith('_Dice')]
+    Dice_keys = [k for k in mean_results.keys() if k.endswith('_Dice')]
+    
+    mean_results['mean_wDice'] = float(np.mean([mean_results[k] for k in wDice_keys])) if wDice_keys else 0.0
+    mean_results['mean_Dice'] = float(np.mean([mean_results[k] for k in Dice_keys])) if Dice_keys else 0.0
 
     print(f"\nOverall Mean wDice: {mean_results['mean_wDice']:.4f}")
+    print(f"Overall Mean Dice:  {mean_results['mean_Dice']:.4f}")
+    
     print(f"\nPer-bundle wDice (averaged across {len(all_subject_results)} subjects):")
-    for bundle in sorted(mean_results.keys()):
-        if bundle != 'mean_wDice':
-            print(f"  {bundle:15s}: {mean_results[bundle]:.4f}")
+    for bundle in sorted(wDice_keys):
+        print(f"  {bundle:15s}: {mean_results[bundle]:.4f}")
+        
+    print(f"\nPer-bundle Dice (averaged across {len(all_subject_results)} subjects):")
+    for bundle in sorted(Dice_keys):
+        base_name = bundle.replace('_Dice', '')
+        print(f"  {base_name:15s}: {mean_results[bundle]:.4f}")
 
     # Save per-subject results as JSON
     json_path = os.path.join(args.output_dir, 'wdice_per_subject.json')
@@ -543,41 +595,70 @@ def main():
         print("  (pandas not available, skipping CSV export)")
 
     # Generate plots
+    wdice_plot_data = {k: v for k, v in mean_results.items() if not k.endswith('_Dice')}
     plot_wdice_results(
-        mean_results,
+        wdice_plot_data,
         os.path.join(args.output_dir, 'wdice_per_bundle.png'),
         title="Per-Bundle wDice (Averaged Across Subjects)"
     )
+    
+    dice_plot_data = {k.replace('_Dice', ''): v for k, v in mean_results.items() if k.endswith('_Dice') or k == 'mean_Dice'}
+    if 'mean_Dice' in mean_results:
+        dice_plot_data['mean_wDice'] = mean_results['mean_Dice'] # Rename for plot function compat
+    
+    plot_wdice_results(
+        dice_plot_data,
+        os.path.join(args.output_dir, 'dice_per_bundle.png'),
+        title="Per-Bundle Dice (Averaged Across Subjects)"
+    )
 
-    # Per-subject wDice bar chart
+    # Per-subject wDice and Dice bar charts
     try:
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
 
         subjects = list(all_subject_results.keys())
-        mean_scores = [all_subject_results[s]['mean_wDice'] for s in subjects]
+        mean_wdice_scores = [all_subject_results[s]['mean_wDice'] for s in subjects]
+        mean_dice_scores = [all_subject_results[s]['mean_Dice'] for s in subjects]
 
-        fig, ax = plt.subplots(figsize=(max(8, len(subjects) * 0.5), 5))
-        colors = plt.cm.RdYlGn(np.array(mean_scores))
-        ax.bar(range(len(subjects)), mean_scores, color=colors, edgecolor='gray')
-        ax.set_xticks(range(len(subjects)))
-        ax.set_xticklabels(subjects, rotation=45, ha='right', fontsize=8)
-        ax.set_ylabel('Mean wDice', fontsize=12)
-        ax.set_title('Mean wDice per Subject', fontsize=13)
-        ax.set_ylim(0, 1.05)
-        ax.axhline(
+        fig, axes = plt.subplots(1, 2, figsize=(max(14, len(subjects)), 5))
+        
+        # wDice plot
+        colors = plt.cm.RdYlGn(np.array(mean_wdice_scores))
+        axes[0].bar(range(len(subjects)), mean_wdice_scores, color=colors, edgecolor='gray')
+        axes[0].set_xticks(range(len(subjects)))
+        axes[0].set_xticklabels(subjects, rotation=45, ha='right', fontsize=8)
+        axes[0].set_ylabel('Mean wDice', fontsize=12)
+        axes[0].set_title('Mean wDice per Subject', fontsize=13)
+        axes[0].set_ylim(0, 1.05)
+        axes[0].axhline(
             y=mean_results['mean_wDice'], color='navy', linestyle='--',
             linewidth=1.5, label=f"Overall Mean = {mean_results['mean_wDice']:.4f}"
         )
-        ax.legend()
+        axes[0].legend()
+        
+        # Dice plot
+        colors = plt.cm.RdYlGn(np.array(mean_dice_scores))
+        axes[1].bar(range(len(subjects)), mean_dice_scores, color=colors, edgecolor='gray')
+        axes[1].set_xticks(range(len(subjects)))
+        axes[1].set_xticklabels(subjects, rotation=45, ha='right', fontsize=8)
+        axes[1].set_ylabel('Mean Dice', fontsize=12)
+        axes[1].set_title('Mean Dice per Subject', fontsize=13)
+        axes[1].set_ylim(0, 1.05)
+        axes[1].axhline(
+            y=mean_results.get('mean_Dice', 0.0), color='navy', linestyle='--',
+            linewidth=1.5, label=f"Overall Mean = {mean_results.get('mean_Dice', 0.0):.4f}"
+        )
+        axes[1].legend()
+        
         plt.tight_layout()
         plt.savefig(
-            os.path.join(args.output_dir, 'wdice_per_subject.png'),
+            os.path.join(args.output_dir, 'metrics_per_subject.png'),
             dpi=150, bbox_inches='tight'
         )
         plt.close()
-        print(f"  📊 Saved per-subject wDice plot")
+        print(f"  📊 Saved per-subject metrics plot")
     except Exception as e:
         print(f"  ⚠ Could not generate per-subject plot: {e}")
 

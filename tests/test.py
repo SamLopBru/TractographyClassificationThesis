@@ -131,16 +131,24 @@ def evaluate_model(
     model: nn.Module,
     dataloader: DataLoader,
     device: torch.device,
-    use_amp: bool = True
+    use_amp: bool = True,
+    preds_dir: Optional[str] = None
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Run inference on the test set.
+    Run inference on the test set, optionally loading/saving to preds_dir.
     
     Returns:
         all_labels: Ground truth labels
         all_preds: Predicted labels
         all_probs: Softmax probabilities for all classes
     """
+    if preds_dir is not None:
+        preds_file = os.path.join(preds_dir, "global_preds.npz")
+        if os.path.exists(preds_file):
+            print(f"📦 Loading saved global predictions from {preds_file}")
+            data = np.load(preds_file)
+            return data['labels'], data['preds'], data['probs']
+            
     model.eval()
     
     all_labels = []
@@ -174,6 +182,12 @@ def evaluate_model(
     
     print(f"Total samples evaluated: {len(all_labels)}")
     
+    if preds_dir is not None:
+        os.makedirs(preds_dir, exist_ok=True)
+        preds_file = os.path.join(preds_dir, "global_preds.npz")
+        np.savez_compressed(preds_file, labels=all_labels, preds=all_preds, probs=all_probs)
+        print(f"💾 Saved global predictions to {preds_file}")
+        
     return all_labels, all_preds, all_probs
 
 
@@ -198,15 +212,21 @@ def compute_metrics(
     metrics['f1_weighted'] = f1_score(labels, preds, average='weighted', zero_division=0) * 100
     
     # Per-class metrics
-    metrics['precision_per_class'] = precision_score(labels, preds, average=None, zero_division=0) * 100
-    metrics['recall_per_class'] = recall_score(labels, preds, average=None, zero_division=0) * 100
-    metrics['f1_per_class'] = f1_score(labels, preds, average=None, zero_division=0) * 100
+    all_classes = list(range(num_classes))
+    metrics['precision_per_class'] = precision_score(labels, preds, labels=all_classes, average=None, zero_division=0) * 100
+    metrics['recall_per_class'] = recall_score(labels, preds, labels=all_classes, average=None, zero_division=0) * 100
+    metrics['f1_per_class'] = f1_score(labels, preds, labels=all_classes, average=None, zero_division=0) * 100
     
     # Top-k accuracy
     if num_classes > 2:
         for k in [3, 5]:
             if k < num_classes:
-                metrics[f'top_{k}_accuracy'] = top_k_accuracy_score(labels, probs, k=k) * 100
+                metrics[f'top_{k}_accuracy'] = top_k_accuracy_score(
+                    labels,
+                    probs,
+                    k=k,
+                    labels=list(range(num_classes))
+                ) * 100
     
     # Confusion matrix
     metrics['confusion_matrix'] = confusion_matrix(labels, preds)
@@ -214,10 +234,12 @@ def compute_metrics(
     # Classification report
     target_names = class_names if class_names else [f"Class {i}" for i in range(num_classes)]
     present_classes = np.unique(np.concatenate([labels, preds]))
-    target_names_present = [target_names[i] for i in present_classes]
+    
     metrics['classification_report'] = classification_report(
-        labels, preds, 
-        target_names=target_names_present, 
+        labels, 
+        preds, 
+        labels=present_classes,
+        target_names=[target_names[i] for i in present_classes],
         zero_division=0
     )
     
@@ -225,6 +247,80 @@ def compute_metrics(
     unique, counts = np.unique(labels, return_counts=True)
     metrics['samples_per_class'] = dict(zip(unique.tolist(), counts.tolist()))
     
+    # Expected Calibration Error (ECE)
+    n_bins = 15
+    confidences = probs.max(axis=1)
+    correct = (labels == preds).astype(float)
+    bin_boundaries = np.linspace(0, 1, n_bins + 1)
+    bin_accs, bin_confs, bin_counts = [], [], []
+    for lo, hi in zip(bin_boundaries[:-1], bin_boundaries[1:]):
+        mask = (confidences >= lo) & (confidences < hi) if hi < 1 else (confidences >= lo) & (confidences <= hi)
+        if mask.sum() == 0:
+            bin_accs.append(0.0)
+            bin_confs.append(0.0)
+            bin_counts.append(0)
+            continue
+        bin_accs.append(correct[mask].mean())
+        bin_confs.append(confidences[mask].mean())
+        bin_counts.append(int(mask.sum()))
+    total = len(labels)
+    ece = sum(bc * abs(ba - bf) for ba, bf, bc in zip(bin_accs, bin_confs, bin_counts)) / total
+    metrics['ece'] = ece * 100  # as percentage
+    metrics['ece_bin_accs'] = bin_accs
+    metrics['ece_bin_confs'] = bin_confs
+    metrics['ece_bin_counts'] = bin_counts
+    metrics['ece_bin_boundaries'] = bin_boundaries.tolist()
+    
+    # ROC-AUC (One-vs-Rest)
+    try:
+        labels_bin = label_binarize(labels, classes=list(range(num_classes)))
+        per_class_auc = []
+        for i in range(num_classes):
+            if labels_bin[:, i].sum() == 0:
+                per_class_auc.append(float('nan')) # class never appears in the test set
+                continue
+            fpr_i, tpr_i, _ = roc_curve(labels_bin[:, i], probs[:, i])
+            per_class_auc.append(auc(fpr_i, tpr_i))
+        metrics['auc_per_class'] = per_class_auc
+        valid_aucs = [a for a in per_class_auc if not np.isnan(a)]
+        metrics['auc_macro'] = float(np.mean(valid_aucs)) if valid_aucs else 0.0
+        
+        valid_weights = [metrics['samples_per_class'].get(i, 0)
+                         for i, a in enumerate(per_class_auc) if not np.isnan(a)]
+                         
+        metrics['auc_weighted'] = float(np.average(valid_aucs, weights=valid_weights)) if valid_aucs else 0.0
+    except Exception as e:
+        print(f"⚠ ROC-AUC computation failed: {e}")
+        metrics['auc_per_class'] = []
+        metrics['auc_macro'] = 0.0
+        metrics['auc_weighted'] = 0.0
+        
+    # PR-AUC (Average Precision) One-vs-Rest
+    try:
+        from sklearn.metrics import average_precision_score
+        if 'labels_bin' not in locals():
+            labels_bin = label_binarize(labels, classes=list(range(num_classes)))
+        per_class_pr_auc = []
+        for i in range(num_classes):
+            if labels_bin[:, i].sum() == 0:
+                per_class_pr_auc.append(float('nan')) # class never appears in the test set
+                continue
+            ap = average_precision_score(labels_bin[:, i], probs[:, i])
+            per_class_pr_auc.append(ap)
+        metrics['pr_auc_per_class'] = per_class_pr_auc
+        valid_pr_aucs = [a for a in per_class_pr_auc if not np.isnan(a)]
+        metrics['pr_auc_macro'] = float(np.mean(valid_pr_aucs)) if valid_pr_aucs else 0.0
+        
+        valid_weights = [metrics['samples_per_class'].get(i, 0)
+                         for i, a in enumerate(per_class_pr_auc) if not np.isnan(a)]
+                         
+        metrics['pr_auc_weighted'] = float(np.average(valid_pr_aucs, weights=valid_weights)) if valid_pr_aucs else 0.0
+    except Exception as e:
+        print(f"⚠ PR-AUC computation failed: {e}")
+        metrics['pr_auc_per_class'] = []
+        metrics['pr_auc_macro'] = 0.0
+        metrics['pr_auc_weighted'] = 0.0
+        
     return metrics
 
 
@@ -238,8 +334,13 @@ def plot_confusion_matrix(
     """Plot and save confusion matrix."""
     
     if normalize:
-        cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-        cm_normalized = np.nan_to_num(cm_normalized)  # Handle division by zero
+        row_sums = cm.sum(axis=1, keepdims=True)
+        cm_normalized = np.divide(
+            cm.astype('float'), 
+            row_sums, 
+            out=np.zeros_like(cm, dtype='float'), 
+            where=row_sums != 0
+        )
     else:
         cm_normalized = cm
     
@@ -496,6 +597,171 @@ def plot_misclassification_analysis(
     print(f"Saved misclassification analysis plot to {save_path}")
 
 
+def plot_ece_diagram(
+    metrics: Dict,
+    save_path: str,
+    figsize: Tuple[int, int] = (8, 6)
+):
+    """Plot reliability (calibration) diagram with ECE gap bars."""
+    
+    bin_accs = np.array(metrics['ece_bin_accs'])
+    bin_confs = np.array(metrics['ece_bin_confs'])
+    bin_counts = np.array(metrics['ece_bin_counts'])
+    boundaries = np.array(metrics['ece_bin_boundaries'])
+    bin_centers = (boundaries[:-1] + boundaries[1:]) / 2
+    bin_widths = boundaries[1:] - boundaries[:-1]
+    ece = metrics['ece']
+    
+    fig, ax1 = plt.subplots(figsize=figsize)
+    
+    # Perfect calibration line
+    ax1.plot([0, 1], [0, 1], 'k--', linewidth=1.5, label='Perfect calibration')
+    
+    # Accuracy bars
+    non_empty = bin_counts > 0
+    ax1.bar(bin_centers[non_empty], bin_accs[non_empty], width=bin_widths[non_empty],
+            alpha=0.6, color='#3498db', edgecolor='#2980b9', label='Accuracy')
+    
+    # Gap bars (|accuracy - confidence|)
+    gaps = np.abs(bin_accs - bin_confs)
+    ax1.bar(bin_centers[non_empty], gaps[non_empty], width=bin_widths[non_empty],
+            bottom=np.minimum(bin_accs, bin_confs)[non_empty],
+            alpha=0.35, color='#e74c3c', edgecolor='#c0392b', hatch='//',
+            label=f'Gap (ECE = {ece:.2f}%)')
+    
+    ax1.set_xlabel('Confidence', fontsize=12)
+    ax1.set_ylabel('Accuracy', fontsize=12)
+    ax1.set_title('Reliability Diagram (Expected Calibration Error)', fontsize=14)
+    ax1.set_xlim(0, 1)
+    ax1.set_ylim(0, 1)
+    ax1.legend(loc='upper left', fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    
+    # Secondary axis: sample counts per bin
+    ax2 = ax1.twinx()
+    ax2.bar(bin_centers, bin_counts, width=bin_widths, alpha=0.15,
+            color='gray', edgecolor='none')
+    ax2.set_ylabel('Samples per bin', fontsize=10, color='gray')
+    ax2.tick_params(axis='y', labelcolor='gray')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved reliability diagram to {save_path}")
+
+
+def plot_roc_auc(
+    labels: np.ndarray,
+    probs: np.ndarray,
+    num_classes: int,
+    save_path: str,
+    class_names: Optional[List[str]] = None,
+    figsize: Tuple[int, int] = (10, 8)
+):
+    """Plot One-vs-Rest ROC curves for all classes + macro average."""
+    
+    labels_bin = label_binarize(labels, classes=list(range(num_classes)))
+    if class_names is None:
+        class_names = [f"Class {i}" for i in range(num_classes)]
+    
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    # Compute per-class ROC
+    all_fpr, all_tpr, all_auc = {}, {}, {}
+    for i in range(num_classes):
+        if labels_bin[:, i].sum() == 0:
+            continue
+        fpr_i, tpr_i, _ = roc_curve(labels_bin[:, i], probs[:, i])
+        roc_auc_i = auc(fpr_i, tpr_i)
+        all_fpr[i] = fpr_i
+        all_tpr[i] = tpr_i
+        all_auc[i] = roc_auc_i
+    
+    # Plot individual class curves (semi-transparent)
+    cmap = plt.cm.tab20(np.linspace(0, 1, num_classes))
+    for i in sorted(all_auc.keys()):
+        ax.plot(all_fpr[i], all_tpr[i], color=cmap[i], alpha=0.4, linewidth=0.8)
+    
+    # Macro-average ROC curve
+    fpr_grid = np.linspace(0, 1, 200)
+    mean_tpr = np.zeros_like(fpr_grid)
+    for i in all_tpr:
+        mean_tpr += np.interp(fpr_grid, all_fpr[i], all_tpr[i])
+    mean_tpr /= len(all_tpr)
+    macro_auc = auc(fpr_grid, mean_tpr)
+    
+    ax.plot(fpr_grid, mean_tpr, color='navy', linewidth=2.5,
+            label=f'Macro-avg ROC (AUC = {macro_auc:.4f})')
+    
+    # Diagonal
+    ax.plot([0, 1], [0, 1], 'k--', linewidth=1, alpha=0.5)
+    
+    ax.set_xlabel('False Positive Rate', fontsize=12)
+    ax.set_ylabel('True Positive Rate', fontsize=12)
+    ax.set_title('ROC Curves (One-vs-Rest)', fontsize=14)
+    ax.legend(loc='lower right', fontsize=10)
+    ax.set_xlim([0, 1])
+    ax.set_ylim([0, 1.02])
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved ROC-AUC plot to {save_path}")
+
+def plot_pr_curve(
+    labels: np.ndarray,
+    probs: np.ndarray,
+    num_classes: int,
+    save_path: str,
+    class_names: Optional[List[str]] = None,
+    figsize: Tuple[int, int] = (10, 8)
+):
+    """Plot One-vs-Rest Precision-Recall curves for all classes + micro average."""
+    
+    from sklearn.metrics import precision_recall_curve, average_precision_score
+    labels_bin = label_binarize(labels, classes=list(range(num_classes)))
+    if class_names is None:
+        class_names = [f"Class {i}" for i in range(num_classes)]
+    
+    fig, ax = plt.subplots(figsize=figsize)
+    
+    all_precision, all_recall, all_ap = {}, {}, {}
+    for i in range(num_classes):
+        if labels_bin[:, i].sum() == 0:
+            continue
+        precision_i, recall_i, _ = precision_recall_curve(labels_bin[:, i], probs[:, i])
+        ap_i = average_precision_score(labels_bin[:, i], probs[:, i])
+        all_precision[i] = precision_i
+        all_recall[i] = recall_i
+        all_ap[i] = ap_i
+    
+    cmap = plt.cm.tab20(np.linspace(0, 1, num_classes))
+    for i in sorted(all_ap.keys()):
+        ax.plot(all_recall[i], all_precision[i], color=cmap[i], alpha=0.4, linewidth=0.8)
+    
+    try:
+        precision_micro, recall_micro, _ = precision_recall_curve(labels_bin.ravel(), probs.ravel())
+        ap_micro = average_precision_score(labels_bin, probs, average="micro")
+        ax.plot(recall_micro, precision_micro, color='navy', linewidth=2.5,
+                label=f'Micro-avg PR (AP = {ap_micro:.4f})')
+    except Exception as e:
+        print(f"Could not compute micro-average PR curve: {e}")
+    
+    ax.set_xlabel('Recall', fontsize=12)
+    ax.set_ylabel('Precision', fontsize=12)
+    ax.set_title('Precision-Recall Curves (One-vs-Rest)', fontsize=14)
+    ax.legend(loc='lower left', fontsize=10)
+    ax.set_xlim([0, 1])
+    ax.set_ylim([0, 1.02])
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved PR curve plot to {save_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description='Test Streamline Bundle Classifier')
     
@@ -514,7 +780,7 @@ def main():
                         help='DataLoader workers')
     parser.add_argument('--no_amp', action='store_true',
                         help='Disable mixed precision')
-    parser.add_argument('--sampling_pct', type=float, default=0.25,
+    parser.add_argument('--sampling_pct_test', type=float, default=0.25,
                         help='Percentage of test data to use (1.0 = all)')
     parser.add_argument('--pos_encoding', type=str, default=cfg.pos_encoding,
                         choices=['absolute', 'rope'],
@@ -529,6 +795,12 @@ def main():
     parser.add_argument('--scope', type=str, default='testset',
                         choices=['trainset', 'validset', 'testset'],
                         help='Dataset scope for wDice evaluation')
+    parser.add_argument('--preds_dir', type=str, default=None,
+                        help='Directory to save/load inference predictions to avoid recomputing')
+    parser.add_argument('--bootstrap', action='store_true',
+                        help='Compute 95%% Confidence Intervals for Accuracy, wDice, Dice using subject-level bootstrapping')
+    parser.add_argument('--n_bootstraps', type=int, default=1000,
+                        help='Number of bootstrap resamples (default: 1000)')
 
     args = parser.parse_args()
     
@@ -554,31 +826,67 @@ def main():
         print("ERROR: No HDF5 files found in test directory!")
         return
     
-    # Create test dataset (use all data by default for testing)
-    test_dataset = StreamlineDataset(
-        test_files,
-        sampling_percentage=args.sampling_pct,
-        full_sample_threshold=100000  # Effectively disable threshold for test
-    )
+    import time
+    start_time = time.time()
     
-    print(f"Test samples: {len(test_dataset)}")
+    subject_predictions = {}
     
-    # Create dataloader
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=streamline_collate_fn
-    )
+    if args.wdice:
+        print("\n" + "=" * 60)
+        print("RUNNING INFERENCE PER SUBJECT (for Metrics & wDice)")
+        print("=" * 60)
+        
+        all_labels_list = []
+        all_preds_list = []
+        all_probs_list = []
+        
+        for i, hdf5_path in enumerate(test_files):
+            subject_name = Path(hdf5_path).stem
+            print(f"  [{i+1}/{len(test_files)}] Inferring {subject_name}...")
+            gt_labels_subj, pred_labels_subj, probs_subj = run_inference_per_subject(
+                model, str(hdf5_path), device,
+                batch_size=args.batch_size,
+                use_amp=not args.no_amp,
+                preds_dir=args.preds_dir
+            )
+            subject_predictions[subject_name] = (gt_labels_subj, pred_labels_subj, probs_subj)
+            
+            all_labels_list.extend(gt_labels_subj)
+            all_preds_list.extend(pred_labels_subj)
+            all_probs_list.append(probs_subj)
+            
+        labels = np.array(all_labels_list)
+        preds = np.array(all_preds_list)
+        probs = np.concatenate(all_probs_list, axis=0) if all_probs_list else np.array([])
+    else:
+        # Create test dataset (use all data by default for testing)
+        test_dataset = StreamlineDataset(
+            test_files,
+            sampling_percentage=args.sampling_pct_test,
+            full_sample_threshold=100000  # Effectively disable threshold for test
+        )
+        
+        print(f"Test samples: {len(test_dataset)}")
+        
+        # Create dataloader
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=streamline_collate_fn
+        )
+        
+        # Run evaluation
+        labels, preds, probs = evaluate_model(model, test_loader, device, use_amp=not args.no_amp, preds_dir=args.preds_dir)
+
+    inference_time = time.time() - start_time
+    print(f"\n⏱️ Inference completed in {inference_time:.2f} seconds.")
     
-    # Run evaluation
-    labels, preds, probs = evaluate_model(model, test_loader, device, use_amp=not args.no_amp)
-    
-    # Get class names (if available, otherwise use class IDs)
+    # Get class names from ID_TO_TRACT mapping
     unique_classes = np.unique(np.concatenate([labels, preds]))
-    class_names = [f"Bundle_{i}" for i in range(cfg.num_classes)]
+    class_names = [ID_TO_TRACT.get(i, f"Bundle_{i}") for i in range(cfg.num_classes)]
     
     # Compute metrics
     print("\n" + "=" * 60)
@@ -599,6 +907,12 @@ def main():
         print(f"   Top-3 Accuracy:    {metrics['top_3_accuracy']:.2f}%")
     if 'top_5_accuracy' in metrics:
         print(f"   Top-5 Accuracy:    {metrics['top_5_accuracy']:.2f}%")
+    
+    print(f"   ECE:               {metrics['ece']:.2f}%")
+    print(f"   ROC-AUC (macro):   {metrics['auc_macro']:.4f}")
+    print(f"   ROC-AUC (weighted):{metrics['auc_weighted']:.4f}")
+    print(f"   PR-AUC (macro):    {metrics['pr_auc_macro']:.4f}")
+    print(f"   PR-AUC (weighted): {metrics['pr_auc_weighted']:.4f}")
     
     print(f"\n📋 Classification Report:\n")
     print(metrics['classification_report'])
@@ -656,6 +970,26 @@ def main():
         class_names=class_names
     )
     
+    # 7. Reliability diagram (ECE)
+    plot_ece_diagram(
+        metrics,
+        os.path.join(args.output_dir, 'reliability_diagram.png')
+    )
+    
+    # 8. ROC-AUC curves
+    plot_roc_auc(
+        labels, probs, cfg.num_classes,
+        os.path.join(args.output_dir, 'roc_auc.png'),
+        class_names=class_names
+    )
+    
+    # 9. Precision-Recall curves
+    plot_pr_curve(
+        labels, probs, cfg.num_classes,
+        os.path.join(args.output_dir, 'pr_auc.png'),
+        class_names=class_names
+    )
+    
     # Save metrics to JSON
     metrics_to_save = {
         'accuracy': metrics['accuracy'],
@@ -668,13 +1002,20 @@ def main():
         'samples_per_class': metrics['samples_per_class'],
         'total_samples': len(labels),
         'total_correct': int((labels == preds).sum()),
-        'total_incorrect': int((labels != preds).sum())
+        'total_incorrect': int((labels != preds).sum()),
+        'inference_time_seconds': inference_time
     }
     
     if 'top_3_accuracy' in metrics:
         metrics_to_save['top_3_accuracy'] = metrics['top_3_accuracy']
     if 'top_5_accuracy' in metrics:
         metrics_to_save['top_5_accuracy'] = metrics['top_5_accuracy']
+    
+    metrics_to_save['ece'] = metrics['ece']
+    metrics_to_save['auc_macro'] = metrics['auc_macro']
+    metrics_to_save['auc_weighted'] = metrics['auc_weighted']
+    metrics_to_save['pr_auc_macro'] = metrics['pr_auc_macro']
+    metrics_to_save['pr_auc_weighted'] = metrics['pr_auc_weighted']
     
     metrics_file = os.path.join(args.output_dir, 'test_metrics.json')
     with open(metrics_file, 'w') as f:
@@ -690,7 +1031,7 @@ def main():
         from utils.dataset_handler import Tractoinferno_handler
         from collections import defaultdict as _defaultdict
 
-        wdice_out = os.path.join(args.output_dir, 'wdice')
+        wdice_out = os.path.join(args.output_dir, 'wDice')
         os.makedirs(wdice_out, exist_ok=True)
 
         # Get test HDF5 files
@@ -718,13 +1059,9 @@ def main():
             subject_path = pathlib.Path(subject_info['T1w']).parent.parent
             mri_path = subject_info['T1w']
 
-            # Run inference per subject (uses the already-loaded model)
-            print(f"  🧠 Running per-subject inference...")
-            gt_labels_subj, pred_labels_subj, _ = run_inference_per_subject(
-                model, str(hdf5_path), device,
-                batch_size=args.batch_size,
-                use_amp=not args.no_amp
-            )
+            # Retrieve already computed per-subject inference
+    
+            gt_labels_subj, pred_labels_subj, _ = subject_predictions[subject_name]
             accuracy_subj = np.mean(np.array(gt_labels_subj) == np.array(pred_labels_subj)) * 100
             print(f"  📈 Subject accuracy: {accuracy_subj:.2f}%")
 
@@ -739,44 +1076,54 @@ def main():
             subject_results = compute_subject_wdice(
                 tract_streamlines, gt_labels_subj, pred_labels_subj, affine
             )
+            subject_results['accuracy'] = float(accuracy_subj)
 
             all_subject_results[subject_name] = subject_results
             for bundle, score in subject_results.items():
                 aggregate_wdice[bundle].append(score)
 
-            print(f"  ✅ Mean wDice: {subject_results['mean_wDice']:.4f}")
+            print(f"  ✅ Mean wDice: {subject_results['mean_wDice']:.4f}  |  Mean Dice: {subject_results.get('mean_Dice', 0.0):.4f}")
 
         # Aggregate results across subjects
         if all_subject_results:
             print(f"\n{'='*60}")
-            print("AGGREGATE wDice RESULTS")
+            print("AGGREGATE wDice/Dice RESULTS")
             print(f"{'='*60}")
 
             mean_results = {}
             for bundle, scores in aggregate_wdice.items():
-                if bundle != 'mean_wDice':
+                if bundle not in ['mean_wDice', 'mean_Dice']:
                     mean_results[bundle] = float(np.mean(scores))
-            mean_results['mean_wDice'] = float(np.mean(
-                [v for k, v in mean_results.items() if k != 'mean_wDice']
-            ))
+                    
+            wDice_keys = [k for k in mean_results.keys() if not k.endswith('_Dice')]
+            Dice_keys = [k for k in mean_results.keys() if k.endswith('_Dice')]
+
+            mean_results['mean_wDice'] = float(np.mean([mean_results[k] for k in wDice_keys])) if wDice_keys else 0.0
+            mean_results['mean_Dice'] = float(np.mean([mean_results[k] for k in Dice_keys])) if Dice_keys else 0.0
 
             print(f"\nOverall Mean wDice: {mean_results['mean_wDice']:.4f}")
+            print(f"Overall Mean Dice:  {mean_results['mean_Dice']:.4f}")
+            
             print(f"\nPer-bundle wDice (averaged across {len(all_subject_results)} subjects):")
-            for bundle in sorted(mean_results.keys()):
-                if bundle != 'mean_wDice':
-                    print(f"  {bundle:15s}: {mean_results[bundle]:.4f}")
+            for bundle in sorted(wDice_keys):
+                print(f"  {bundle:15s}: {mean_results[bundle]:.4f}")
+
+            print(f"\nPer-bundle Dice (averaged across {len(all_subject_results)} subjects):")
+            for bundle in sorted(Dice_keys):
+                base_name = bundle.replace('_Dice', '')
+                print(f"  {base_name:15s}: {mean_results[bundle]:.4f}")
 
             # Save per-subject JSON
             json_path = os.path.join(wdice_out, 'wdice_per_subject.json')
             with open(json_path, 'w') as f:
                 json.dump(all_subject_results, f, indent=2)
-            print(f"\n💾 Per-subject wDice saved to {json_path}")
+            print(f"\n💾 Per-subject metrics saved to {json_path}")
 
             # Save aggregate JSON
             agg_json_path = os.path.join(wdice_out, 'wdice_aggregate.json')
             with open(agg_json_path, 'w') as f:
                 json.dump(mean_results, f, indent=2)
-            print(f"💾 Aggregate wDice saved to {agg_json_path}")
+            print(f"💾 Aggregate metrics saved to {agg_json_path}")
 
             # CSV summary
             try:
@@ -794,17 +1141,60 @@ def main():
                 pass
 
             # Plot wDice results
+            wdice_plot_data = {k: v for k, v in mean_results.items() if not k.endswith('_Dice')}
             plot_wdice_results(
-                mean_results,
+                wdice_plot_data,
                 os.path.join(wdice_out, 'wdice_per_bundle.png'),
                 title="Per-Bundle wDice (Averaged Across Subjects)"
             )
+            
+            dice_plot_data = {k.replace('_Dice', ''): v for k, v in mean_results.items() if k.endswith('_Dice') or k == 'mean_Dice'}
+            if 'mean_Dice' in mean_results:
+                dice_plot_data['mean_wDice'] = mean_results['mean_Dice'] # rename for compat
+                
+            plot_wdice_results(
+                dice_plot_data,
+                os.path.join(wdice_out, 'dice_per_bundle.png'),
+                title="Per-Bundle Dice (Averaged Across Subjects)"
+            )
 
-            # Add wDice to the saved metrics JSON
+            # Add wDice and Dice to the saved metrics JSON
             metrics_to_save['mean_wDice'] = mean_results['mean_wDice']
+            metrics_to_save['mean_Dice'] = mean_results['mean_Dice']
             with open(metrics_file, 'w') as f:
                 json.dump(metrics_to_save, f, indent=2)
-            print(f"📝 Updated {metrics_file} with mean_wDice")
+            print(f"📝 Updated {metrics_file} with mean_wDice and mean_Dice")
+            
+            # --- Bootstrap subject-level metrics ---
+            if args.bootstrap and len(all_subject_results) > 1:
+                print(f"\n{'='*60}")
+                print(f"BOOTSTRAP 95% CONFIDENCE INTERVALS (N={args.n_bootstraps})")
+                print(f"{'='*60}")
+                rng = np.random.default_rng(42)
+                subjs = list(all_subject_results.keys())
+                n_subjs = len(subjs)
+                
+                bs_wdice, bs_dice, bs_acc = [], [], []
+                
+                print("Computing CIs via subject-level resampling...")
+                for _ in range(args.n_bootstraps):
+                    indices = rng.choice(n_subjs, size=n_subjs, replace=True)
+                    sampled = [subjs[idx] for idx in indices]
+                    bs_wdice.append(np.mean([all_subject_results[s].get('mean_wDice', 0.0) for s in sampled]))
+                    bs_dice.append(np.mean([all_subject_results[s].get('mean_Dice', 0.0) for s in sampled]))
+                    bs_acc.append(np.mean([all_subject_results[s].get('accuracy', 0.0) for s in sampled]))
+                
+                print(f"  Subject-level Accuracy: {np.mean(bs_acc):.2f}% (95% CI: [{np.percentile(bs_acc, 2.5):.2f}%, {np.percentile(bs_acc, 97.5):.2f}%])")
+                print(f"  Subject-level wDice:    {np.mean(bs_wdice):.4f}  (95% CI: [{np.percentile(bs_wdice, 2.5):.4f}, {np.percentile(bs_wdice, 97.5):.4f}])")
+                print(f"  Subject-level Dice:     {np.mean(bs_dice):.4f}  (95% CI: [{np.percentile(bs_dice, 2.5):.4f}, {np.percentile(bs_dice, 97.5):.4f}])")
+                
+                metrics_to_save['bootstrap_95ci_accuracy'] = [np.percentile(bs_acc, 2.5), np.percentile(bs_acc, 97.5)]
+                metrics_to_save['bootstrap_95ci_wDice'] = [np.percentile(bs_wdice, 2.5), np.percentile(bs_wdice, 97.5)]
+                metrics_to_save['bootstrap_95ci_Dice'] = [np.percentile(bs_dice, 2.5), np.percentile(bs_dice, 97.5)]
+                
+                with open(metrics_file, 'w') as f:
+                    json.dump(metrics_to_save, f, indent=2)
+                print(f"📝 Appended Bootstrap CIs to {metrics_file}")
 
         else:
             print("\n⚠ No subjects processed for wDice!")
@@ -875,6 +1265,8 @@ def compare_test_results(results_dir: str = 'tests/test_results',
                         wdice_data = json.load(wf)
                     if 'mean_wDice' in wdice_data:
                         metrics['mean_wDice'] = wdice_data['mean_wDice']
+                    if 'mean_Dice' in wdice_data:
+                        metrics['mean_Dice'] = wdice_data['mean_Dice']
 
         experiments[exp_dir.name] = metrics
 
@@ -900,14 +1292,16 @@ def compare_test_results(results_dir: str = 'tests/test_results',
     summary_rows = []
     metric_keys = ['accuracy', 'f1_macro', 'f1_weighted', 'precision_macro',
                    'recall_macro', 'top_3_accuracy', 'top_5_accuracy',
-                   'mean_wDice']
+                   'ece', 'auc_macro', 'auc_weighted', 'mean_wDice', 'mean_Dice']
     for name, m in experiments.items():
         row = {'experiment': name}
         for k in metric_keys:
             row[k] = m.get(k, None)
-        # Convert mean_wDice to percentage for consistency with other metrics
+        # Convert mean_wDice and mean_Dice to percentage for consistency with other metrics
         if row.get('mean_wDice') is not None:
             row['mean_wDice'] = row['mean_wDice'] * 100
+        if row.get('mean_Dice') is not None:
+            row['mean_Dice'] = row['mean_Dice'] * 100
         summary_rows.append(row)
 
     df_summary = pd.DataFrame(summary_rows).sort_values('f1_macro', ascending=False)
@@ -1168,7 +1562,7 @@ python test.py --batch_size 256
 python test.py --no_amp
 
 # Test on a subset of data (10%)
-python test.py --sampling_pct 0.1
+python test.py --sampling_pct_test 0.1
 
 # Run classification metrics + wDice in one go
 python test.py --checkpoint checkpoints/exp/best_model.pt --wdice
