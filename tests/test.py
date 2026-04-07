@@ -717,7 +717,7 @@ def plot_pr_curve(
     class_names: Optional[List[str]] = None,
     figsize: Tuple[int, int] = (10, 8)
 ):
-    """Plot One-vs-Rest Precision-Recall curves for all classes + micro average."""
+    """Plot One-vs-Rest Precision-Recall curves for all classes + macro average."""
     
     from sklearn.metrics import precision_recall_curve, average_precision_score
     labels_bin = label_binarize(labels, classes=list(range(num_classes)))
@@ -740,13 +740,25 @@ def plot_pr_curve(
     for i in sorted(all_ap.keys()):
         ax.plot(all_recall[i], all_precision[i], color=cmap[i], alpha=0.4, linewidth=0.8)
     
+    # Calculate Macro-average PR curve
     try:
-        precision_micro, recall_micro, _ = precision_recall_curve(labels_bin.ravel(), probs.ravel())
-        ap_micro = average_precision_score(labels_bin, probs, average="micro")
-        ax.plot(recall_micro, precision_micro, color='navy', linewidth=2.5,
-                label=f'Micro-avg PR (AP = {ap_micro:.4f})')
+        recall_grid = np.linspace(0, 1, 200)
+        mean_precision = np.zeros_like(recall_grid)
+        valid_classes = 0
+        for i in all_recall:
+            # precision_recall_curve returns recall from high to low, so reverse it
+            rec = all_recall[i][::-1]
+            prec = all_precision[i][::-1]
+            mean_precision += np.interp(recall_grid, rec, prec)
+            valid_classes += 1
+        
+        if valid_classes > 0:
+            mean_precision /= valid_classes
+            macro_ap = np.mean([all_ap[i] for i in all_ap])
+            ax.plot(recall_grid, mean_precision, color='navy', linewidth=2.5,
+                    label=f'Macro-avg PR (AP = {macro_ap:.4f})')
     except Exception as e:
-        print(f"Could not compute micro-average PR curve: {e}")
+        print(f"Could not compute macro-average PR curve: {e}")
     
     ax.set_xlabel('Recall', fontsize=12)
     ax.set_ylabel('Precision', fontsize=12)
@@ -918,6 +930,7 @@ def main():
     print(metrics['classification_report'])
     
     # Save classification report to file
+    os.makedirs(args.output_dir, exist_ok=True)  # Safeguard in case dir was deleted during inference
     report_path = os.path.join(args.output_dir, 'classification_report.txt')
     with open(report_path, 'w') as f:
         f.write(metrics['classification_report'])
@@ -1207,7 +1220,7 @@ def main():
         print(f"📁 wDice results saved to: {wdice_out}/")
 
 
-def compare_test_results(results_dir: str = 'tests/test_results',
+def compare_test_results(results_dir: str = 'tests/test_results_2',
                          wdice_dir: str = 'tests/wdice_results'):
     """
     Compare test results across all experiments.
@@ -1525,7 +1538,7 @@ if __name__ == '__main__':
         # Remove --compare from argv so argparse doesn't complain
         _sys.argv.remove('--compare')
         # Check for optional --results_dir argument
-        results_dir = 'tests/test_results'
+        results_dir = 'tests/test_results_2'
         if '--results_dir' in _sys.argv:
             idx = _sys.argv.index('--results_dir')
             results_dir = _sys.argv[idx + 1]

@@ -3,14 +3,32 @@
 # Experiment Runner Script
 # Usage: ./run_experiments.sh
 
-echo "Starting Experiments..."
-echo "======================="
+echo "Starting experiments..."
+echo ""
 
-uv run tests/test.py --checkpoint checkpoints/contrastive_pretrained_proj_256/best_model.pt --wdice --output_dir test_results/contrastive_pretrained_proj_256
+EXPERIMENT_NAME="transformer_base_config_rmsnorm_retrain"
 
-uv run tests/test.py --checkpoint checkpoints/contrastive_cosine_restarts/best_model.pt --wdice --output_dir test_results/contrastive_cosine_restarts
+echo "Training: $EXPERIMENT_NAME"
+uv run src/train.py \
+  --experiment_name $EXPERIMENT_NAME \
+  --encoder_type "transformer" \
+  --warmup_steps 1500 \
+  --patience 15 \
+  --norm_layer "rmsnorm" \
+  --epochs 50
+
+echo ""
+echo "Full Test: $EXPERIMENT_NAME"
+uv run tests/test.py \
+  --checkpoint checkpoints/${EXPERIMENT_NAME}/best_model.pt \
+  --output_dir tests/best_results/${EXPERIMENT_NAME} \
+  --sampling_pct_test 0.5 \
+  --wdice \
+  --bootstrap
+
+uv run tests/test.py --compare
+
 
 echo ""
 echo "======================="
-echo "All ex  periments completed!"
-  
+echo "All experiments completed!"

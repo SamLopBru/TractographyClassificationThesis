@@ -649,7 +649,7 @@ def main():
         persistent_workers=False, prefetch_factor=2
     )
     
-    # Create encoder (without classifier — we only use get_embeddings())
+    # Create encoder (without classifier — it only uses get_embeddings())
     if args.encoder_type == 'transformer':
         encoder = TransformerEncoder(
             input_size=cfg.input_size,
@@ -691,9 +691,13 @@ def main():
     print(f"Projection Head: {sum(p.numel() for p in projection_head.parameters()):,} params")
     print(f"Total: {total_params:,} params")
     
-    # Compile encoder for speed
-    encoder = torch.compile(encoder, dynamic=True)
-    print("Encoder compiled with torch.compile(dynamic=True)")
+    # Compile encoder for speed (skip for custom layers that cause recompilation issues)
+    uses_custom_layers = args.norm_layer == 'rmsnorm' or args.pos_encoding == 'rope'
+    if not uses_custom_layers:
+        encoder = torch.compile(encoder, dynamic=True)
+        print("Encoder compiled with torch.compile(dynamic=True)")
+    else:
+        print(f"Skipping torch.compile (custom layers: norm={args.norm_layer}, pos={args.pos_encoding})")
     
     # LR scaling
     if args.no_lr_scaling:

@@ -21,7 +21,6 @@ class RMSNorm(nn.Module):
         rms = torch.sqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         return x / rms * self.weight
 
-
 def _make_norm(norm_type: str, d_model: int) -> nn.Module:
     """Factory to create the requested normalization layer."""
     if norm_type == "rmsnorm":
@@ -520,3 +519,4 @@ def create_encoder(
     else:
         raise ValueError(f"Unknown encoder type: {encoder_type}")
 
+ 

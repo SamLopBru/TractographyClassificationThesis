@@ -19,6 +19,7 @@ class TrainConfig:
     train_dir: str = "sequences/trainset"
     val_dir: str = "sequences/validset"
     sampling_pct: float = 0.10          # Percentage of streamlines to index per tract
+    sampling_pct_test: float = 0.25     # Percentage of streamlines to index per tract for testing
     epoch_sampling_pct: float = 0.05    # Percentage of indexed streamlines per epoch
     val_sampling_pct: float = 0.10      # Percentage of validation streamlines to use (higher = more stable metrics)
     min_samples_per_class: int = 10     # Minimum samples per class per epoch

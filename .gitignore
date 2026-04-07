@@ -28,8 +28,11 @@ tests/test_results*
 tests/bundle_analysis* 
 tests/comparison*
 tests/wdice_results*
+visualizations*
 
 # Jupyter notebooks checkpoints
 .ipynb_checkpoints/
 
 tests/bundle_analysis
+
+utils/pruebas.py
