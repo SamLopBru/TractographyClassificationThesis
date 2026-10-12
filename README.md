@@ -215,16 +215,44 @@ For reproducible comparisons between experiments:
 The main entry points currently include:
 
 ```text
-.
+
+TractographyClassificationThesis/
+├── .gitignore
+├── .python-version
+├── MasterThesis.pdf
+├── README.md
+├── main.py
+├── pyproject.toml
+├── run_experiments.sh
+├── uv.lock
+├── preprocessing/
+│   ├── sequencer.py
+│   ├── sequencer_analysis.ipynb
+│   ├── _utils/
+│   │   └── radius_normalization.py
+│   └── csvs/
+│       ├── normalization_parameters_testset.csv
+│       ├── normalization_parameters_trainset.csv
+│       └── normalization_parameters_validset.csv
 ├── src/
 │   ├── config.py
-│   ├── train.py
-│   └── contrastive_train.py
-├── checkpoints/
-└── README.md
+│   ├── contrastive_train.py
+│   ├── encoder.py
+│   └── train.py
+├── tests/
+│   └── test.py
+└── utils/
+    ├── dataloader.py
+    ├── dataset_handler.py
+    └── visualize_embeddings.py
 ```
 
-Additional modules, data-processing scripts, evaluation utilities, and configuration files may be present elsewhere in the repository.
+* src/: Main project code, including configuration, the encoder, and scripts for supervised and contrastive training.
+* preprocessing/: Preprocessing and analysis; includes PCA calculations, sequencing, normalization, and an exploratory notebook.
+* preprocessing/csvs/: Separate normalization parameters for the training, validation, and test datasets.
+* utils/: data loading and management, as well as embedding visualization.
+* tests/: project tests code.
+* Root: documentation, entry point, experiment execution, and dependency configuration.
 
 ## Research Context
 
@@ -237,4 +265,4 @@ The work is intended for research and experimentation. Clinical use would requir
 The experiments use TractoInferno as the evaluation dataset. Please consult the dataset's official documentation and associated publication for details on data access, citation, and usage conditions.
 
 ## Final Note
-The project is currently been improved and more experiments are been carried on with publication purposes. The full thesis with all results and conclusions can be found in [Master's thesis.pdf](https://github.com/SamLopBru/TractographyClassificationThesis/blob/main/MasterThesis.pdf)
+The project is currently been improved and more experiments are been carried on with publication purposes in this [repo](https://github.com/SamLopBru/tractographySegmentation.git). The full thesis with all results and conclusions can be found in [Master's thesis.pdf](https://github.com/SamLopBru/TractographyClassificationThesis/blob/main/MasterThesis.pdf)
