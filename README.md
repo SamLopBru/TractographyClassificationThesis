@@ -212,4 +212,4 @@ The work is intended for research and experimentation. Clinical use would requir
 The experiments use TractoInferno as the evaluation dataset. Please consult the dataset's official documentation and associated publication for details on data access, citation, and usage conditions.
 
 ## Final Note
-The project is currently been improved and more experiments are been carried on with publication purposes. For more information about this Masther Thesis please read
+The project is currently been improved and more experiments are been carried on with publication purposes. The full thesis with all results and conclusions can be found in [Master's thesis.pdf](https://github.com/SamLopBru/TractographyClassificationThesis/blob/main/MastherThesis.pdf)
