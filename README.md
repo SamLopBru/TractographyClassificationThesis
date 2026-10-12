@@ -175,6 +175,31 @@ chmod +x run_experiments.sh
 
 The script stops if an experiment exits with an error. Ensure the dataset, dependencies, and required configuration are available before running it.
 
+## Inference
+
+The repository also supports running inference with trained models on test or validation datasets using tests/test.py.
+
+### Run inference on a dataset
+
+To run inference on the test set using the script's default checkpoint configuration:
+
+```uv run tests/test.py --test_dir sequences/testset```
+
+### Run inference with a specific checkpoint
+
+To specify a trained model checkpoint explicitly, use the --checkpoint argument:
+
+```uv run tests/test.py \
+  --test_dir sequences/validset \
+  --checkpoint checkpoints/latest_checkpoint.pt
+```
+
+* --test_dir: Path to the dataset directory containing the sequences to evaluate.
+
+* --checkpoint: Path to the model checkpoint to load for inference. This argument can be used to select a specific trained model.
+
+Make sure the input data follows the format expected by the inference pipeline and that the selected checkpoint is compatible with the model configuration.
+
 ## Reproducibility
 
 For reproducible comparisons between experiments:
